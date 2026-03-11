@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
-import { Activity, Globe, Shield, Waves, Play, Loader2, Filter } from "lucide-react";
+import { Activity, Globe, Shield, Waves, Play, Loader2, Filter, Download } from "lucide-react";
 import L from "leaflet";
 
 // Fix for default marker icon in react-leaflet
@@ -52,6 +52,8 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [agentStatus, setAgentStatus] = useState<string | null>(null);
   const [selectedFunderFilter, setSelectedFunderFilter] = useState<string>("All");
+  const [telemetry, setTelemetry] = useState<any[]>([]);
+  const [targetMode, setTargetMode] = useState<string>("test");
 
   const fetchProjects = async () => {
     try {
@@ -63,43 +65,58 @@ export default function App() {
     }
   };
 
+  const fetchTelemetry = async () => {
+    try {
+      const res = await fetch("/api/telemetry");
+      const data = await res.json();
+      setTelemetry(data);
+    } catch (error) {
+      console.error("Failed to fetch telemetry:", error);
+    }
+  };
+
   useEffect(() => {
     fetchProjects();
+    fetchTelemetry();
   }, []);
 
-  const deploySwarm = async () => {
+  const deploySwarm = async (engine: 'tinyfish' | 'gemini') => {
     setLoading(true);
-    setAgentStatus("Swarm deployed. Dispatching agents to 32 foundations...");
     
-    // Dispatch all agents
-    for (let i = 0; i < TARGET_PORTALS.length; i++) {
-      const portal = TARGET_PORTALS[i];
+    const targets = targetMode === "test" ? [TARGET_PORTALS[0]] : TARGET_PORTALS;
+    
+    setAgentStatus(`Swarm deployed (${engine}). Dispatching agents to ${targets.length} foundation(s)...`);
+    
+    // Dispatch agents
+    for (let i = 0; i < targets.length; i++) {
+      const portal = targets[i];
       try {
         await fetch("/api/agent/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ targetUrl: portal.url }),
+          body: JSON.stringify({ targetUrl: portal.url, engine }),
         });
       } catch (error) {
         console.error(`Failed to dispatch agent for ${portal.name}`, error);
       }
     }
     
-    setAgentStatus("All agents dispatched. Monitoring swarm telemetry...");
+    setAgentStatus(`All agents dispatched (${engine}). Monitoring swarm telemetry...`);
 
     // Poll for completion
     const pollInterval = setInterval(async () => {
       try {
         await fetchProjects();
+        await fetchTelemetry();
         const res = await fetch("/api/agent/status");
         const data = await res.json();
         
         if (data.activeAgents === 0 && data.queuedAgents === 0) {
           clearInterval(pollInterval);
-          setAgentStatus(`Swarm mission complete. All targets processed.`);
+          setAgentStatus(`Swarm mission complete (${engine}). All targets processed.`);
           setLoading(false);
         } else {
-          setAgentStatus(`Swarm active. ${data.activeAgents} agents extracting data, ${data.queuedAgents} targets queued...`);
+          setAgentStatus(`Swarm active (${engine}). ${data.activeAgents} agents extracting data, ${data.queuedAgents} targets queued...`);
         }
       } catch (error) {
         console.error("Failed to fetch swarm status", error);
@@ -113,6 +130,16 @@ export default function App() {
   const filteredFeatures = selectedFunderFilter === "All" 
     ? projects.features 
     : projects.features.filter((f: any) => f.properties.funder === selectedFunderFilter);
+
+  const exportGeoJSON = () => {
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify({ type: "FeatureCollection", features: filteredFeatures }));
+    const downloadAnchorNode = document.createElement('a');
+    downloadAnchorNode.setAttribute("href", dataStr);
+    downloadAnchorNode.setAttribute("download", "blue_intelligence_projects.geojson");
+    document.body.appendChild(downloadAnchorNode); // required for firefox
+    downloadAnchorNode.click();
+    downloadAnchorNode.remove();
+  };
 
   return (
     <div className="flex h-screen w-full bg-slate-950 text-slate-200 font-sans overflow-hidden">
@@ -134,23 +161,76 @@ export default function App() {
               <Globe className="w-4 h-4" /> Target Acquisition
             </h2>
 
-            <button 
-              onClick={deploySwarm}
-              disabled={loading}
-              className="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium py-2.5 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-              {loading ? "Swarm Active..." : "Deploy Swarm"}
-            </button>
+            <div className="flex flex-col gap-2">
+              <select 
+                value={targetMode}
+                onChange={(e) => setTargetMode(e.target.value)}
+                disabled={loading}
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm text-slate-200 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none mb-2 disabled:opacity-50"
+              >
+                <option value="test">Test Mode (1 Foundation)</option>
+                <option value="full">Full Swarm (32 Foundations)</option>
+              </select>
+
+              <button 
+                onClick={() => deploySwarm('tinyfish')}
+                disabled={loading}
+                className="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium py-2.5 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                {loading ? "Swarm Active..." : "Deploy Swarm (TinyFish)"}
+              </button>
+              
+              <button 
+                onClick={() => deploySwarm('gemini')}
+                disabled={loading}
+                className="w-full bg-purple-600 hover:bg-purple-500 text-white font-medium py-2.5 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                {loading ? "Swarm Active..." : "Compare with Gemini"}
+              </button>
+            </div>
           </div>
 
           <div className="mb-8">
             <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2">
               <Activity className="w-4 h-4" /> Swarm Telemetry
             </h2>
-            <div className="bg-slate-950 rounded-lg p-4 border border-slate-800 font-mono text-xs text-slate-300 min-h-[100px]">
+            <div className="bg-slate-950 rounded-lg p-4 border border-slate-800 font-mono text-xs text-slate-300 min-h-[100px] mb-2">
               {agentStatus || "Awaiting deployment orders..."}
             </div>
+            {telemetry.length > 0 && (
+              <div className="bg-slate-950 rounded-lg border border-slate-800 overflow-hidden">
+                <div className="max-h-48 overflow-y-auto">
+                  <table className="w-full text-left text-[10px] text-slate-300">
+                    <thead className="bg-slate-900 sticky top-0">
+                      <tr>
+                        <th className="p-2">Engine</th>
+                        <th className="p-2">Status</th>
+                        <th className="p-2">Time</th>
+                        <th className="p-2">Found</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {telemetry.map((t, i) => (
+                        <tr key={i} className="border-t border-slate-800/50">
+                          <td className="p-2 font-semibold" style={{ color: t.engine === 'gemini' ? '#a855f7' : '#3b82f6' }}>
+                            {t.engine.toUpperCase()}
+                          </td>
+                          <td className="p-2">
+                            <span className={t.status === 'SUCCESS' ? 'text-green-400' : 'text-red-400'}>
+                              {t.status}
+                            </span>
+                          </td>
+                          <td className="p-2">{(t.duration_ms / 1000).toFixed(1)}s</td>
+                          <td className="p-2">{t.projects_found}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </div>
 
           <div>
@@ -183,10 +263,7 @@ export default function App() {
                   <div key={f.properties.id} className="p-3 bg-slate-950/50 border border-slate-800 rounded-lg hover:border-blue-500/50 transition-colors">
                     <h3 className="text-sm font-bold text-slate-200 truncate">{f.properties.title}</h3>
                     <p className="text-xs text-slate-500 truncate">{f.properties.funder}</p>
-                    <div className="flex justify-between items-center mt-2">
-                      <span className="text-[10px] uppercase tracking-wider text-blue-400 bg-blue-400/10 px-2 py-0.5 rounded-full">
-                        {f.properties.category}
-                      </span>
+                    <div className="flex justify-end items-center mt-2">
                       <span className="text-[10px] font-mono text-slate-500">
                         {f.geometry.coordinates[1].toFixed(2)}, {f.geometry.coordinates[0].toFixed(2)}
                       </span>
@@ -197,13 +274,28 @@ export default function App() {
             </div>
           </div>
         </div>
+        
+        {/* Export Button at the bottom of sidebar */}
+        <div className="p-4 border-t border-slate-800 bg-slate-900">
+          <button 
+            onClick={exportGeoJSON}
+            disabled={filteredFeatures.length === 0}
+            className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed border border-slate-700"
+          >
+            <Download className="w-4 h-4" />
+            Export GeoJSON
+          </button>
+        </div>
       </div>
 
       {/* Map Area */}
       <div className="flex-1 relative">
         <MapContainer 
-          center={[20, 0]} 
-          zoom={3} 
+          center={[46.2276, 2.2137]} 
+          zoom={2} 
+          minZoom={2}
+          maxBounds={[[-90, -180], [90, 180]]}
+          maxBoundsViscosity={1.0}
           className="w-full h-full"
           zoomControl={false}
         >
@@ -230,10 +322,13 @@ export default function App() {
                   <h3 className="font-bold text-sm mb-1">{feature.properties.title}</h3>
                   <p className="text-xs text-gray-400 mb-2">{feature.properties.funder}</p>
                   <p className="text-xs mb-2">{feature.properties.description}</p>
+                  {(feature.properties.start_date || feature.properties.end_date) && (
+                    <div className="text-[10px] text-gray-500 mb-2 flex flex-col gap-0.5">
+                      {feature.properties.start_date && <span><strong>Start:</strong> {feature.properties.start_date}</span>}
+                      {feature.properties.end_date && <span><strong>End:</strong> {feature.properties.end_date}</span>}
+                    </div>
+                  )}
                   <div className="flex gap-2 mt-2">
-                    <span className="px-2 py-1 bg-blue-100 text-blue-800 text-[10px] rounded-full uppercase font-semibold">
-                      {feature.properties.category}
-                    </span>
                     <span className="px-2 py-1 bg-green-100 text-green-800 text-[10px] rounded-full uppercase font-semibold">
                       {feature.properties.status}
                     </span>

@@ -27,6 +27,8 @@ db.exec(`
     category TEXT,
     status TEXT,
     image_url TEXT,
+    start_date TEXT,
+    end_date TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
@@ -36,6 +38,26 @@ try {
 } catch (e) {
   // Column might already exist, ignore error
 }
+
+try {
+  db.exec(`ALTER TABLE projects ADD COLUMN start_date TEXT`);
+  db.exec(`ALTER TABLE projects ADD COLUMN end_date TEXT`);
+} catch (e) {
+  // Columns might already exist, ignore error
+}
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS telemetry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    engine TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    status TEXT NOT NULL,
+    projects_found INTEGER DEFAULT 0,
+    duration_ms INTEGER NOT NULL,
+    error_message TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
 
 const GOAL_PROMPT = `Blue Intelligence Swarm: System Instructions v2.01. Identity & Mission
 You are the Lead Agent of the Global Project Swarm. Your mission is to autonomously identify, validate, and map global marine protection, restoration, and conservation initiatives. You operate within a parallel worker pool of 8 agents, ensuring high-concurrency data extraction with geospatial precision.
@@ -78,15 +100,17 @@ Output strictly valid JSON. No conversational filler. Every project must include
         "relevance_score": 0.00,
         "category": "Habitat/Species/Fisheries",
         "status": "Active/Completed",
-        "image_url": "https://example.com/image.jpg"
+        "image_url": "https://example.com/image.jpg",
+        "start_date": "YYYY-MM-DD",
+        "end_date": "YYYY-MM-DD"
       }
     }
   ]
 }`;
 
-const agentQueue: string[] = [];
+const agentQueue: { url: string, engine: 'tinyfish' | 'gemini' }[] = [];
 let activeAgents = 0;
-const MAX_CONCURRENT_AGENTS = 8;
+const MAX_CONCURRENT_AGENTS = 2; // Reduced to 2 to respect TinyFish limits
 
 async function processQueue() {
   if (activeAgents >= MAX_CONCURRENT_AGENTS || agentQueue.length === 0) {
@@ -94,71 +118,174 @@ async function processQueue() {
   }
   
   activeAgents++;
-  const targetUrl = agentQueue.shift()!;
+  const task = agentQueue.shift()!;
   
   try {
-    await runTinyFishAgent(targetUrl);
+    if (task.engine === 'gemini') {
+      await runGeminiAgent(task.url);
+    } else {
+      await runTinyFishAgent(task.url);
+    }
   } catch (error) {
-    console.error(`Agent failed for ${targetUrl}:`, error);
+    console.error(`Agent failed for ${task.url}:`, error);
   } finally {
     activeAgents--;
     processQueue();
   }
 }
 
-async function runGeminiFallback(targetUrl: string) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is not configured");
-  }
-  const ai = new GoogleGenAI({ apiKey });
-  
-  const prompt = `
-    ${GOAL_PROMPT}
-    
-    Target URL to analyze: ${targetUrl}
-    
-    Please use the googleSearch tool to find marine conservation projects associated with this foundation/URL.
-    Extract the projects and return them as a FeatureCollection JSON.
-  `;
+function saveProjects(projects: any[]) {
+  const insertStmt = db.prepare(`
+    INSERT INTO projects (title, url, description, funder, lat, lng, category, status, relevance_score, image_url, start_date, end_date)
+    VALUES (@title, @url, @description, @funder, @lat, @lng, @category, @status, @relevance_score, @image_url, @start_date, @end_date)
+    ON CONFLICT(url) DO UPDATE SET
+      title = excluded.title,
+      description = excluded.description,
+      funder = excluded.funder,
+      lat = excluded.lat,
+      lng = excluded.lng,
+      category = excluded.category,
+      status = excluded.status,
+      image_url = excluded.image_url,
+      start_date = excluded.start_date,
+      end_date = excluded.end_date,
+      relevance_score = excluded.relevance_score
+  `);
 
-  const response = await ai.models.generateContent({
-    model: "gemini-3.1-pro-preview",
-    contents: prompt,
-    config: {
-      tools: [{ googleSearch: {} }],
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          type: { type: Type.STRING },
-          features: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                type: { type: Type.STRING },
-                geometry: {
-                  type: Type.OBJECT,
-                  properties: {
-                    type: { type: Type.STRING },
-                    coordinates: {
-                      type: Type.ARRAY,
-                      items: { type: Type.NUMBER }
-                    }
-                  }
-                },
+  let count = 0;
+  const insertMany = db.transaction((projs) => {
+    for (const p of projs) {
+      if (p && p.title && p.url && p.lat !== undefined && p.lng !== undefined) {
+         const lat = parseFloat(p.lat);
+         const lng = parseFloat(p.lng);
+         
+         if (!isNaN(lat) && !isNaN(lng)) {
+           insertStmt.run({
+             title: p.title,
+             url: p.url,
+             description: p.description || "",
+             funder: Array.isArray(p.funder) ? p.funder.join(", ") : (p.funder || ""),
+             lat: lat,
+             lng: lng,
+             category: p.category || "General",
+             status: p.status || "Active",
+             image_url: p.image_url || null,
+             start_date: p.start_date || null,
+             end_date: p.end_date || null,
+             relevance_score: p.relevance_score || 0.95
+           });
+           count++;
+         }
+      }
+    }
+  });
+
+  insertMany(projects);
+  return count;
+}
+
+function recordTelemetry(engine: string, targetUrl: string, status: string, projectsFound: number, durationMs: number, errorMessage: string | null = null) {
+  db.prepare(`
+    INSERT INTO telemetry (engine, target_url, status, projects_found, duration_ms, error_message)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(engine, targetUrl, status, projectsFound, durationMs, errorMessage);
+}
+
+function parseProjectsData(projectsData: any) {
+  let projects = projectsData;
+  if (typeof projects === 'string') {
+    try {
+      const cleaned = projects.replace(/```json/g, '').replace(/```/g, '').trim();
+      projects = JSON.parse(cleaned);
+    } catch (e) {
+      console.error("Failed to parse string result:", projects);
+      projects = [];
+    }
+  }
+
+  if (!Array.isArray(projects)) {
+    if (projects.type === "FeatureCollection" && Array.isArray(projects.features)) {
+       projects = projects.features;
+    } else if (projects.projects && Array.isArray(projects.projects)) {
+      projects = projects.projects;
+    } else if (projects.features && Array.isArray(projects.features)) {
+       projects = projects.features;
+    } else {
+      projects = [projects];
+    }
+  }
+  
+  // Map GeoJSON features to flat objects
+  return projects.map((p: any) => {
+    if (p.type === "Feature" && p.properties && p.geometry) {
+      return {
+        ...p.properties,
+        lat: p.geometry.coordinates?.[1],
+        lng: p.geometry.coordinates?.[0]
+      };
+    }
+    return p;
+  });
+}
+
+async function runGeminiAgent(targetUrl: string) {
+  const startTime = performance.now();
+  try {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error("GEMINI_API_KEY is not configured");
+    }
+    const ai = new GoogleGenAI({ apiKey });
+    
+    const prompt = `
+      ${GOAL_PROMPT}
+      
+      Target URL to analyze: ${targetUrl}
+      
+      Please use the googleSearch tool to find marine conservation projects associated with this foundation/URL.
+      Extract the projects and return them as a FeatureCollection JSON.
+    `;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.1-pro-preview",
+      contents: prompt,
+      config: {
+        tools: [{ googleSearch: {} }],
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            type: { type: Type.STRING },
+            features: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
                 properties: {
-                  type: Type.OBJECT,
+                  type: { type: Type.STRING },
+                  geometry: {
+                    type: Type.OBJECT,
+                    properties: {
+                      type: { type: Type.STRING },
+                      coordinates: {
+                        type: Type.ARRAY,
+                        items: { type: Type.NUMBER }
+                      }
+                    }
+                  },
                   properties: {
-                    title: { type: Type.STRING },
-                    url: { type: Type.STRING },
-                    description: { type: Type.STRING },
-                    funder: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    relevance_score: { type: Type.NUMBER },
-                    category: { type: Type.STRING },
-                    status: { type: Type.STRING },
-                    image_url: { type: Type.STRING }
+                    type: Type.OBJECT,
+                    properties: {
+                      title: { type: Type.STRING },
+                      url: { type: Type.STRING },
+                      description: { type: Type.STRING },
+                      funder: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      relevance_score: { type: Type.NUMBER },
+                      category: { type: Type.STRING },
+                      status: { type: Type.STRING },
+                      image_url: { type: Type.STRING },
+                      start_date: { type: Type.STRING },
+                      end_date: { type: Type.STRING }
+                    }
                   }
                 }
               }
@@ -166,18 +293,26 @@ async function runGeminiFallback(targetUrl: string) {
           }
         }
       }
-    }
-  });
+    });
 
-  if (response.text) {
-    return JSON.parse(response.text);
+    let projectsFound = 0;
+    if (response.text) {
+      const parsed = JSON.parse(response.text);
+      const projects = parseProjectsData(parsed);
+      projectsFound = saveProjects(projects);
+    }
+    
+    const duration = Math.round(performance.now() - startTime);
+    recordTelemetry('gemini', targetUrl, 'SUCCESS', projectsFound, duration);
+  } catch (error: any) {
+    const duration = Math.round(performance.now() - startTime);
+    recordTelemetry('gemini', targetUrl, 'ERROR', 0, duration, error.message);
+    throw error;
   }
-  return null;
 }
 
 async function runTinyFishAgent(targetUrl: string) {
-  let projects: any = null;
-
+  const startTime = performance.now();
   try {
     const apiKey = process.env.TINYFISH_API_KEY;
     if (!apiKey) throw new Error("TINYFISH_API_KEY is not configured");
@@ -207,95 +342,26 @@ async function runTinyFishAgent(targetUrl: string) {
     }
 
     const data = await response.json();
+    let projectsFound = 0;
     
     if (data.status === "COMPLETED" && data.result) {
-      projects = data.result;
+      const projects = parseProjectsData(data.result);
+      projectsFound = saveProjects(projects);
     }
+    
+    const duration = Math.round(performance.now() - startTime);
+    recordTelemetry('tinyfish', targetUrl, 'SUCCESS', projectsFound, duration);
   } catch (error: any) {
+    const duration = Math.round(performance.now() - startTime);
+    recordTelemetry('tinyfish', targetUrl, 'ERROR', 0, duration, error.message);
+    
     console.warn(`TinyFish failed for ${targetUrl}, falling back to Gemini:`, error.message);
     try {
-      projects = await runGeminiFallback(targetUrl);
+      await runGeminiAgent(targetUrl);
     } catch (geminiError: any) {
       console.error(`Gemini fallback also failed for ${targetUrl}:`, geminiError.message);
       throw geminiError;
     }
-  }
-
-  if (projects) {
-    if (typeof projects === 'string') {
-      try {
-        const cleaned = projects.replace(/```json/g, '').replace(/```/g, '').trim();
-        projects = JSON.parse(cleaned);
-      } catch (e) {
-        console.error("Failed to parse string result:", projects);
-        projects = [];
-      }
-    }
-
-    if (!Array.isArray(projects)) {
-      if (projects.type === "FeatureCollection" && Array.isArray(projects.features)) {
-         projects = projects.features;
-      } else if (projects.projects && Array.isArray(projects.projects)) {
-        projects = projects.projects;
-      } else if (projects.features && Array.isArray(projects.features)) {
-         projects = projects.features;
-      } else {
-        projects = [projects];
-      }
-    }
-    
-    // Map GeoJSON features to flat objects
-    projects = projects.map((p: any) => {
-      if (p.type === "Feature" && p.properties && p.geometry) {
-        return {
-          ...p.properties,
-          lat: p.geometry.coordinates?.[1],
-          lng: p.geometry.coordinates?.[0]
-        };
-      }
-      return p;
-    });
-
-    const insertStmt = db.prepare(`
-      INSERT INTO projects (title, url, description, funder, lat, lng, category, status, relevance_score, image_url)
-      VALUES (@title, @url, @description, @funder, @lat, @lng, @category, @status, @relevance_score, @image_url)
-      ON CONFLICT(url) DO UPDATE SET
-        title = excluded.title,
-        description = excluded.description,
-        funder = excluded.funder,
-        lat = excluded.lat,
-        lng = excluded.lng,
-        category = excluded.category,
-        status = excluded.status,
-        image_url = excluded.image_url,
-        relevance_score = excluded.relevance_score
-    `);
-
-    const insertMany = db.transaction((projs) => {
-      for (const p of projs) {
-        if (p && p.title && p.url && p.lat !== undefined && p.lng !== undefined) {
-           const lat = parseFloat(p.lat);
-           const lng = parseFloat(p.lng);
-           
-           if (!isNaN(lat) && !isNaN(lng)) {
-             insertStmt.run({
-               title: p.title,
-               url: p.url,
-               description: p.description || "",
-               funder: Array.isArray(p.funder) ? p.funder.join(", ") : (p.funder || ""),
-               lat: lat,
-               lng: lng,
-               category: p.category || "General",
-               status: p.status || "Active",
-               image_url: p.image_url || null,
-               relevance_score: p.relevance_score || 0.95
-             });
-           }
-        }
-      }
-    });
-
-    insertMany(projects);
   }
 }
 
@@ -328,6 +394,8 @@ async function startServer() {
             category: p.category,
             status: p.status,
             image_url: p.image_url,
+            start_date: p.start_date,
+            end_date: p.end_date,
           },
         })),
       };
@@ -339,8 +407,18 @@ async function startServer() {
     }
   });
 
+  app.get("/api/telemetry", (req, res) => {
+    try {
+      const telemetry = db.prepare("SELECT * FROM telemetry ORDER BY created_at DESC LIMIT 100").all();
+      res.json(telemetry);
+    } catch (error) {
+      console.error("Error fetching telemetry:", error);
+      res.status(500).json({ error: "Failed to fetch telemetry" });
+    }
+  });
+
   app.post("/api/agent/start", async (req, res) => {
-    const { targetUrl } = req.body;
+    const { targetUrl, engine = 'tinyfish' } = req.body;
     
     if (!targetUrl) {
       return res.status(400).json({ error: "targetUrl is required" });
@@ -353,8 +431,8 @@ async function startServer() {
     }
 
     // Add to queue and process in background
-    if (!agentQueue.includes(targetUrl)) {
-      agentQueue.push(targetUrl);
+    if (!agentQueue.find(t => t.url === targetUrl && t.engine === engine)) {
+      agentQueue.push({ url: targetUrl, engine });
       processQueue();
     }
 
