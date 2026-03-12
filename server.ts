@@ -5,6 +5,10 @@ import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
+import { JSDOM } from "jsdom";
+import { Readability } from "@mozilla/readability";
+import TurndownService from "turndown";
+import { GoogleGenAI, Type } from "@google/genai";
 
 dotenv.config();
 
@@ -106,31 +110,59 @@ try {
   db.exec(`ALTER TABLE telemetry ADD COLUMN raw_response TEXT`);
 } catch (e) {}
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS failed_extractions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_url TEXT NOT NULL,
+    project_url TEXT UNIQUE NOT NULL,
+    error_message TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 const GOAL_PROMPT = `
 ### Objective
-Extract EVERY SINGLE marine conservation or restoration project listed on this website without exception.
+L'agent doit uniquement naviguer, gérer la pagination (cliquer sur "Suivant" ou "Charger plus") et identifier les liens vers les fiches individuelles.
 
 ### Instructions
 1. Navigate to the project directory or listing page.
 2. If there is pagination (e.g., "Next", "Page 2", numbers), you MUST visit every page.
-3. If there is a "Load More" button or infinite scroll, you MUST trigger it repeatedly until ALL projects are visible. Do not stop after 30 projects. Keep clicking until the button disappears.
-4. For each and every project found, extract:
-   - title (name of the project)
-   - url (link to the project page)
-   - description (brief summary)
-   - funder (the organization funding it)
-   - lat (latitude, estimate based on location if not precise)
-   - lng (longitude, estimate based on location if not precise)
-   - category (e.g., Coral, Mangroves, MPA, Policy)
-   - status (e.g., Active, Completed)
-   - image_url (MANDATORY: find a project-specific image, thumbnail, or hero image; avoid generic site logos. Look for images in project galleries or headers)
-   - start_date / end_date (if available)
+3. If there is a "Load More" button or infinite scroll, you MUST trigger it repeatedly until ALL projects are visible. Keep clicking until the button disappears.
+4. Identify the links to the individual project detail pages.
+5. DO NOT extract detailed data (no descriptions, no coordinates). ONLY extract the URLs.
 
 ### Output Format
-Return ONLY a clean JSON array of objects. Do not stop until you have captured all available projects (there may be 50+).
+Return ONLY a clean JSON array of strings representing the absolute URLs of the projects.
+Example: ["https://example.com/project1", "https://example.com/project2"]
 `;
 
-const agentQueue: { url: string, proxy?: string }[] = [];
+const EXTRACT_PROMPT = `
+### Objective
+L'agent doit lire la page du projet et extraire les informations détaillées.
+
+### Instructions
+1. Read the project details on the page.
+2. Extract the following information: title, description, funder, latitude, longitude, category, status, image_url, start_date, end_date.
+3. If some information is missing, use null or a reasonable default (e.g., 0 for lat/lng if not found).
+
+### Output Format
+Return ONLY a valid JSON object matching this schema:
+{
+  "title": "string",
+  "url": "string",
+  "description": "string",
+  "funder": "string",
+  "lat": number,
+  "lng": number,
+  "category": "string",
+  "status": "string",
+  "image_url": "string",
+  "start_date": "string",
+  "end_date": "string"
+}
+`;
+
+const agentQueue: { url: string, proxy?: string, mode?: 'discover' | 'extract' }[] = [];
 let activeAgents = 0;
 const MAX_CONCURRENT_AGENTS = 2;
 
@@ -146,7 +178,7 @@ async function processQueue() {
   const task = agentQueue.shift()!;
   
   try {
-    await runTinyFishAgent(task.url, task.proxy);
+    await runTinyFishAgent(task.url, task.proxy, 0, task.mode || 'discover');
   } catch (error) {
     console.error(`Agent failed for ${task.url}:`, error);
   } finally {
@@ -316,9 +348,194 @@ function parseProjectsData(projectsData: any) {
   });
 }
 
-async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 0) {
+import { htmlToMarkdown } from "mdream";
+import FirecrawlApp from "@mendable/firecrawl-js";
+
+const turndownService = new TurndownService();
+
+async function fetchMarkdown(url: string): Promise<{ markdown: string, method: string }> {
+  let html = "";
+  try {
+    // Niveau 1: Local & Gratuit (Readability)
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    html = await res.text();
+    
+    const doc = new JSDOM(html, { url });
+    const reader = new Readability(doc.window.document);
+    const article = reader.parse();
+    
+    if (article && article.textContent.length > 500) {
+      const markdown = turndownService.turndown(article.content);
+      return { markdown, method: 'Readability' };
+    } else {
+      throw new Error('Content too short or empty (JS-heavy)');
+    }
+  } catch (err: any) {
+    console.log(`[Web Reading] Readability failed for ${url} (${err.message}), switching to Mdream...`);
+    
+    try {
+      // Niveau 2: Mdream
+      if (html) {
+        const markdown = await htmlToMarkdown(html);
+        if (markdown && markdown.length > 500) {
+           return { markdown, method: 'Mdream' };
+        }
+      }
+      throw new Error('Mdream result too short or empty');
+    } catch (mdreamErr: any) {
+      console.log(`[Web Reading] Mdream failed for ${url} (${mdreamErr.message}), switching to fallbacks...`);
+      
+      // Niveau 3: Jina Reader
+      if (process.env.JINA_READER_API_KEY) {
+        try {
+          console.log(`[Web Reading] Trying Jina Reader for ${url}...`);
+          const jinaRes = await fetch(`https://r.jina.ai/${url}`, {
+            headers: { 'Authorization': `Bearer ${process.env.JINA_READER_API_KEY}` }
+          });
+          if (!jinaRes.ok) throw new Error(`Jina HTTP ${jinaRes.status}`);
+          const markdown = await jinaRes.text();
+          if (markdown && markdown.length > 500) {
+            return { markdown, method: 'Jina Reader' };
+          }
+          throw new Error('Jina Reader result too short or empty');
+        } catch (jinaErr: any) {
+          console.log(`[Web Reading] Jina Reader failed for ${url} (${jinaErr.message})`);
+        }
+      }
+
+      // Niveau 4: Scrape.do
+      const scrapeDoKey = process.env['SCRAPE.DO_API_KEY'] || process.env.SCRAPE_DO_API_KEY;
+      if (scrapeDoKey) {
+        try {
+          console.log(`[Web Reading] Trying Scrape.do for ${url}...`);
+          const scrapeRes = await fetch(`http://api.scrape.do?token=${scrapeDoKey}&url=${encodeURIComponent(url)}`);
+          if (!scrapeRes.ok) throw new Error(`Scrape.do HTTP ${scrapeRes.status}`);
+          const scrapeHtml = await scrapeRes.text();
+          const markdown = await htmlToMarkdown(scrapeHtml);
+          if (markdown && markdown.length > 500) {
+            return { markdown, method: 'Scrape.do' };
+          }
+          throw new Error('Scrape.do result too short or empty');
+        } catch (scrapeErr: any) {
+          console.log(`[Web Reading] Scrape.do failed for ${url} (${scrapeErr.message})`);
+        }
+      }
+
+      // Niveau 5: Firecrawl
+      if (process.env.FIRECRAWL_API_KEY) {
+        try {
+          const firecrawl = new FirecrawlApp({ apiKey: process.env.FIRECRAWL_API_KEY });
+          const scrapeResult = await firecrawl.scrape(url, { formats: ['markdown'] }) as any;
+          if (!scrapeResult.success) {
+            throw new Error(scrapeResult.error || "Firecrawl scrape failed");
+          }
+          return { markdown: scrapeResult.markdown || "", method: 'Firecrawl' };
+        } catch (firecrawlErr: any) {
+          console.log(`[Web Reading] Firecrawl failed for ${url} (${firecrawlErr.message})`);
+          throw new Error(`All extraction methods failed. Last error: ${firecrawlErr.message}`);
+        }
+      } else {
+        throw new Error(`All extraction methods failed. No API keys available for fallback.`);
+      }
+    }
+  }
+}
+
+async function extractProjectData(markdown: string, url: string) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY is not configured");
+  
+  const ai = new GoogleGenAI({ apiKey });
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.1-flash-preview',
+      contents: `Extract the marine conservation project details from the following markdown content. The project URL is ${url}.\n\nMarkdown Content:\n${markdown}`,
+      config: {
+        temperature: 0,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING },
+            url: { type: Type.STRING },
+            description: { type: Type.STRING },
+            funder: { type: Type.STRING },
+            lat: { type: Type.NUMBER },
+            lng: { type: Type.NUMBER },
+            category: { type: Type.STRING },
+            status: { type: Type.STRING },
+            image_url: { type: Type.STRING },
+            start_date: { type: Type.STRING },
+            end_date: { type: Type.STRING }
+          },
+          required: ["title", "url", "description", "funder", "lat", "lng", "category", "status", "image_url"]
+        }
+      }
+    });
+    
+    if (!response.text) throw new Error("Empty response from Gemini");
+    return JSON.parse(response.text);
+  } catch (err: any) {
+    throw new Error(`Gemini API Error: ${err.message}`);
+  }
+}
+
+function parseUrlsData(projectsData: any): string[] {
+  console.log(`[Parser] Parsing URLs data of type: ${typeof projectsData}`);
+  let projects = projectsData;
+  
+  if (typeof projects === 'string') {
+    try {
+      const parsed = JSON.parse(projects);
+      if (typeof parsed === 'object' && parsed !== null) {
+        projects = parsed;
+      }
+    } catch (e) {}
+  }
+  
+  if (typeof projects === 'object' && projects !== null && !Array.isArray(projects)) {
+    if (typeof projects.result === 'string') projects = projects.result;
+    else if (typeof projects.output === 'string') projects = projects.output;
+  }
+
+  if (typeof projects === 'string') {
+    try {
+      const jsonMatch = projects.match(/```json\s*([\s\S]*?)\s*```/) || projects.match(/```\s*([\s\S]*?)\s*```/);
+      const cleaned = jsonMatch ? jsonMatch[1] : projects.trim();
+      
+      let jsonStr = cleaned;
+      if (!jsonMatch) {
+        const start = cleaned.indexOf('[');
+        const end = cleaned.lastIndexOf(']');
+        if (start !== -1 && end !== -1) {
+          jsonStr = cleaned.substring(start, end + 1);
+        }
+      }
+      
+      projects = JSON.parse(jsonStr);
+    } catch (e) {
+      console.error("Failed to parse string result:", typeof projects === 'string' ? projects.substring(0, 200) : projects);
+      projects = [];
+    }
+  }
+
+  if (!Array.isArray(projects) && projects !== null && typeof projects === 'object') {
+    if (projects.urls && Array.isArray(projects.urls)) projects = projects.urls;
+    else if (projects.result && Array.isArray(projects.result)) projects = projects.result;
+    else projects = [projects];
+  }
+  
+  if (!Array.isArray(projects)) return [];
+  
+  return projects.filter(p => typeof p === 'string');
+}
+
+async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 0, mode: 'discover' | 'extract' = 'discover') {
   const startTime = performance.now();
-  console.log(`[TinyFish] Starting agent for: ${targetUrl} (Attempt ${retryCount + 1})`);
+  console.log(`[TinyFish] Starting agent for: ${targetUrl} (Attempt ${retryCount + 1}, Mode: ${mode})`);
   let runId = "";
   try {
     const apiKey = process.env.TINYFISH_API_KEY;
@@ -333,7 +550,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
       },
       body: JSON.stringify({
         url: targetUrl,
-        goal: GOAL_PROMPT,
+        goal: mode === 'extract' ? EXTRACT_PROMPT : GOAL_PROMPT,
         max_steps: 60 
       }),
     });
@@ -444,15 +661,125 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
     if (result) {
       rawResponse = typeof result === 'string' ? result : JSON.stringify(result);
       console.log(`[TinyFish] Received result for ${targetUrl}`);
-      const projects = parseProjectsData(result);
-      console.log(`[TinyFish] Parsed ${projects.length} projects for ${targetUrl}`);
       
-      fs.appendFileSync('agent_log.txt', `[${new Date().toISOString()}] Parsed ${projects.length} projects. First project: ${JSON.stringify(projects[0])}\n`);
-      
-      projectsFound = saveProjects(projects);
-      console.log(`[TinyFish] Saved ${projectsFound} projects for ${targetUrl}`);
-      
-      fs.appendFileSync('agent_log.txt', `[${new Date().toISOString()}] Saved ${projectsFound} projects.\n`);
+      if (mode === 'extract') {
+        try {
+          // Parse the JSON result directly
+          let projectData = result;
+          if (typeof result === 'string') {
+            const jsonMatch = result.match(/```json\s*([\s\S]*?)\s*```/) || result.match(/```\s*([\s\S]*?)\s*```/);
+            const cleaned = jsonMatch ? jsonMatch[1] : result.trim();
+            projectData = JSON.parse(cleaned);
+          }
+          
+          const stmt = db.prepare(`
+            INSERT INTO projects (title, url, description, funder, lat, lng, category, status, image_url, start_date, end_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET
+              title = excluded.title,
+              description = excluded.description,
+              funder = excluded.funder,
+              lat = excluded.lat,
+              lng = excluded.lng,
+              category = excluded.category,
+              status = excluded.status,
+              image_url = excluded.image_url,
+              start_date = excluded.start_date,
+              end_date = excluded.end_date
+          `);
+          
+          stmt.run(
+            projectData.title || 'Unknown',
+            projectData.url || targetUrl,
+            projectData.description || '',
+            projectData.funder || 'Unknown',
+            projectData.lat || 0,
+            projectData.lng || 0,
+            projectData.category || 'Marine Conservation',
+            projectData.status || 'Active',
+            projectData.image_url || '',
+            projectData.start_date || null,
+            projectData.end_date || null
+          );
+          
+          try {
+            db.prepare(`DELETE FROM failed_extractions WHERE project_url = ?`).run(targetUrl);
+          } catch (e) {}
+          
+          projectsFound = 1;
+          console.log(`[TinyFish] Extraction mode finished successfully for ${targetUrl}`);
+        } catch (err: any) {
+          console.error(`[TinyFish] Error parsing extraction result for ${targetUrl}:`, err.message);
+          throw new Error(`Failed to parse extraction result: ${err.message}`);
+        }
+      } else {
+        const urls = parseUrlsData(result);
+        console.log(`[TinyFish] Discovered ${urls.length} URLs for ${targetUrl}. Starting hybrid extraction...`);
+        
+        let successCount = 0;
+        for (let i = 0; i < urls.length; i++) {
+          const projectUrl = urls[i];
+          try {
+            const { markdown, method } = await fetchMarkdown(projectUrl);
+            const projectData = await extractProjectData(markdown, projectUrl);
+            
+            // Insert into DB
+            const stmt = db.prepare(`
+              INSERT INTO projects (title, url, description, funder, lat, lng, category, status, image_url, start_date, end_date)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(url) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description,
+                funder = excluded.funder,
+                lat = excluded.lat,
+                lng = excluded.lng,
+                category = excluded.category,
+                status = excluded.status,
+                image_url = excluded.image_url,
+                start_date = excluded.start_date,
+                end_date = excluded.end_date
+            `);
+            
+            stmt.run(
+              projectData.title || 'Unknown',
+              projectData.url || projectUrl,
+              projectData.description || '',
+              projectData.funder || 'Unknown',
+              projectData.lat || 0,
+              projectData.lng || 0,
+              projectData.category || 'Marine Conservation',
+              projectData.status || 'Active',
+              projectData.image_url || '',
+              projectData.start_date || null,
+              projectData.end_date || null
+            );
+            
+            // Remove from failed_extractions if it was there
+            try {
+              db.prepare(`DELETE FROM failed_extractions WHERE project_url = ?`).run(projectUrl);
+            } catch (e) {}
+            
+            console.log(`[Extraction] ${i+1}/${urls.length} URL traitée via (${method}): ${projectUrl}`);
+            successCount++;
+          } catch (err: any) {
+            console.error(`[Extraction] Error processing ${projectUrl}:`, err.message);
+            try {
+              db.prepare(`
+                INSERT INTO failed_extractions (target_url, project_url, error_message)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_url) DO UPDATE SET
+                  error_message = excluded.error_message,
+                  created_at = CURRENT_TIMESTAMP
+              `).run(targetUrl, projectUrl, err.message);
+            } catch (dbErr) {
+              console.error("Failed to save error to DB:", dbErr);
+            }
+          }
+        }
+        
+        projectsFound = successCount;
+        console.log(`[TinyFish] Hybrid extraction finished. Saved ${projectsFound} projects for ${targetUrl}`);
+      }
     }
     
     const duration = Math.round(performance.now() - startTime);
@@ -466,7 +793,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
     if (retryCount < 1 && !error.message.includes("aborted")) {
       console.log(`[TinyFish] Retrying ${targetUrl} due to error...`);
       if (runId) activeRuns.delete(runId);
-      return runTinyFishAgent(targetUrl, proxy, retryCount + 1);
+      return runTinyFishAgent(targetUrl, proxy, retryCount + 1, mode);
     }
     
     recordTelemetry('tinyfish', targetUrl, 'ERROR', 0, duration, error.message);
@@ -494,7 +821,8 @@ async function startServer() {
 
   app.get("/api/config-check", (req, res) => {
     res.json({
-      tinyfishKeySet: !!process.env.TINYFISH_API_KEY
+      tinyfishKeySet: !!process.env.TINYFISH_API_KEY,
+      envKeys: Object.keys(process.env).filter(k => k.includes('FISH') || k.includes('API') || k.includes('KEY') || k.includes('TINY'))
     });
   });
 
@@ -551,6 +879,39 @@ async function startServer() {
       console.error("Error fetching telemetry:", error);
       res.status(500).json({ error: "Failed to fetch telemetry" });
     }
+  });
+
+  app.get("/api/failed-extractions", (req, res) => {
+    try {
+      const failed = db.prepare("SELECT * FROM failed_extractions ORDER BY created_at DESC").all();
+      res.json(failed);
+    } catch (error) {
+      console.error("Error fetching failed extractions:", error);
+      res.status(500).json({ error: "Failed to fetch failed extractions" });
+    }
+  });
+
+  app.post("/api/agent/force-extract", async (req, res) => {
+    const { projectUrls, proxy } = req.body;
+    
+    if (!projectUrls || !Array.isArray(projectUrls) || projectUrls.length === 0) {
+      return res.status(400).json({ error: "projectUrls array is required" });
+    }
+
+    const tinyfishKey = process.env.TINYFISH_API_KEY;
+    if (!tinyfishKey) {
+      return res.status(500).json({ error: "TINYFISH_API_KEY is not configured" });
+    }
+
+    // Add to queue and process in background
+    for (const url of projectUrls) {
+      if (!agentQueue.find(t => t.url === url)) {
+        agentQueue.push({ url, proxy, mode: 'extract' });
+      }
+    }
+    processQueue();
+
+    res.json({ status: "QUEUED", message: `${projectUrls.length} agents deployed in background for forced extraction` });
   });
 
   app.post("/api/agent/start", async (req, res) => {

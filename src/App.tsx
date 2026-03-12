@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
-import { Activity, Globe, Shield, Waves, Play, Loader2, Filter, Download, ExternalLink, AlertCircle } from "lucide-react";
+import { Activity, Globe, Shield, Waves, Play, Loader2, Filter, Download, ExternalLink, AlertCircle, AlertTriangle, RefreshCw } from "lucide-react";
 import L from "leaflet";
 
 // Fix for default marker icon in react-leaflet
@@ -138,6 +138,7 @@ export default function App() {
   const [isManualLoading, setIsManualLoading] = useState(false);
   const [selectedFunderFilter, setSelectedFunderFilter] = useState<string>("All");
   const [telemetry, setTelemetry] = useState<any[]>([]);
+  const [failedExtractions, setFailedExtractions] = useState<any[]>([]);
   const [targetMode, setTargetMode] = useState<string>("test");
   const [activeRuns, setActiveRuns] = useState<any[]>([]);
   const [selectedProxy, setSelectedProxy] = useState<string>("");
@@ -161,9 +162,13 @@ export default function App() {
     try {
       const res = await fetch("/api/projects");
       const data = await res.json();
+      if (!data || !data.features) {
+        console.error("Invalid projects data:", data);
+        return;
+      }
       // Only update if the number of projects has changed or if we had none and now have some
       setProjects(prev => {
-        if (prev.features.length === data.features.length) {
+        if (prev && prev.features && prev.features.length === data.features.length) {
           return prev;
         }
         return data;
@@ -177,9 +182,35 @@ export default function App() {
     try {
       const res = await fetch("/api/telemetry");
       const data = await res.json();
-      setTelemetry(data);
+      if (Array.isArray(data)) {
+        setTelemetry(data);
+      } else {
+        console.error("Invalid telemetry data:", data);
+      }
     } catch (error) {
       console.error("Failed to fetch telemetry:", error);
+    }
+  };
+
+  const fetchFailedExtractions = async () => {
+    try {
+      const res = await fetch("/api/failed-extractions");
+      if (!res.ok) {
+        throw new Error(`HTTP error! status: ${res.status}`);
+      }
+      const text = await res.text();
+      try {
+        const data = JSON.parse(text);
+        if (Array.isArray(data)) {
+          setFailedExtractions(data);
+        } else {
+          console.error("Invalid failed extractions data:", data);
+        }
+      } catch (e) {
+        console.error("Failed to parse failed extractions JSON:", text.substring(0, 100));
+      }
+    } catch (error) {
+      console.error("Failed to fetch failed extractions:", error);
     }
   };
 
@@ -187,6 +218,12 @@ export default function App() {
     try {
       const res = await fetch("/api/agent/active-runs");
       const data = await res.json();
+      
+      if (!Array.isArray(data)) {
+        console.error("Invalid active runs data:", data);
+        return;
+      }
+      
       setActiveRuns(data);
       
       const currentRunIds = new Set(data.map((r: any) => r.id));
@@ -252,11 +289,13 @@ export default function App() {
     fetchTelemetry();
     fetchQueueStatus();
     fetchConfigStatus();
+    fetchFailedExtractions();
     const interval = setInterval(() => {
       fetchProjects();
       fetchActiveRuns();
       fetchTelemetry();
       fetchQueueStatus();
+      fetchFailedExtractions();
     }, 5000);
     return () => {
       clearInterval(interval);
@@ -659,7 +698,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="bg-slate-900 rounded-xl border border-slate-800 overflow-hidden">
+              <div className="bg-slate-900 rounded-xl border border-slate-800 overflow-hidden mb-8">
                 <table className="w-full text-left text-sm text-slate-300">
                   <thead className="bg-slate-800/50">
                     <tr>
@@ -701,6 +740,98 @@ export default function App() {
                         </td>
                       </tr>
                     ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <h3 className="text-xl font-bold text-white mb-4 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <AlertTriangle className="w-5 h-5 text-yellow-400" /> Failed Extractions
+                </div>
+                {failedExtractions.length > 0 && (
+                  <button
+                    onClick={async () => {
+                      try {
+                        await fetch("/api/agent/force-extract", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ 
+                            projectUrls: failedExtractions.map(f => f.project_url),
+                            proxy: selectedProxy
+                          }),
+                        });
+                        setAgentStatus(`Forced extraction queued for ${failedExtractions.length} URLs`);
+                      } catch (error) {
+                        console.error("Failed to queue forced extraction:", error);
+                      }
+                    }}
+                    className="flex items-center gap-2 px-3 py-1.5 bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30 rounded-lg text-sm font-bold transition-colors"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    Force Extract All with TinyFish
+                  </button>
+                )}
+              </h3>
+              
+              <div className="bg-slate-900 rounded-xl border border-slate-800 overflow-hidden">
+                <table className="w-full text-left text-sm text-slate-300">
+                  <thead className="bg-slate-800/50">
+                    <tr>
+                      <th className="p-4">Source URL</th>
+                      <th className="p-4">Project URL</th>
+                      <th className="p-4">Error</th>
+                      <th className="p-4">Time</th>
+                      <th className="p-4">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800">
+                    {failedExtractions.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="p-8 text-center text-slate-500 italic">
+                          No failed extractions recorded.
+                        </td>
+                      </tr>
+                    ) : (
+                      failedExtractions.map((f, idx) => (
+                        <tr key={`failed-row-${f.id || idx}`} className="hover:bg-slate-800/30 transition-colors">
+                          <td className="p-4 font-mono text-xs truncate max-w-[150px]" title={f.target_url}>{f.target_url}</td>
+                          <td className="p-4 font-mono text-xs truncate max-w-[150px]" title={f.project_url}>
+                            <a href={f.project_url} target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">
+                              {f.project_url}
+                            </a>
+                          </td>
+                          <td className="p-4 text-red-400 text-xs max-w-[200px] truncate" title={f.error_message}>
+                            {f.error_message}
+                          </td>
+                          <td className="p-4 text-slate-500 text-xs">
+                            {new Date(f.created_at).toLocaleString()}
+                          </td>
+                          <td className="p-4">
+                            <button
+                              onClick={async () => {
+                                try {
+                                  await fetch("/api/agent/force-extract", {
+                                    method: "POST",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ 
+                                      projectUrls: [f.project_url],
+                                      proxy: selectedProxy
+                                    }),
+                                  });
+                                  setAgentStatus(`Forced extraction queued for ${f.project_url}`);
+                                } catch (error) {
+                                  console.error("Failed to queue forced extraction:", error);
+                                }
+                              }}
+                              className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded transition-colors"
+                              title="Force extract with TinyFish"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               </div>
