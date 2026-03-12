@@ -15,6 +15,8 @@ View your app in AI Studio: https://ai.studio/apps/e59659b1-483a-4af4-b631-27d11
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+2. Create a `.env` file (or `.env.local`) with your API keys:
+   - `TINYFISH_API_KEY` (required for agent extraction)
+   - `CLAUDE_API_KEY` (required for analyzing scraped data; or use `ANTHROPIC_API_KEY`)
 3. Run the app:
    `npm run dev`

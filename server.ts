@@ -8,9 +8,7 @@ import fs from "fs";
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
-import { GoogleGenAI, Type } from "@google/genai";
-
-dotenv.config();
+import Anthropic from "@anthropic-ai/sdk";
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
@@ -21,6 +19,22 @@ process.on('unhandledRejection', (reason, promise) => {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Load .env from project root (explicit path so it works regardless of cwd)
+const envPath = path.join(__dirname, ".env");
+const envLocalPath = path.join(__dirname, ".env.local");
+const result = dotenv.config({ path: envPath });
+dotenv.config({ path: envLocalPath, override: true });
+
+// Fix BOM: if env key has BOM prefix (e.g. from Windows/editor), copy to correct key
+if (result.parsed) {
+  for (const key of Object.keys(result.parsed)) {
+    const cleanKey = key.replace(/^\uFEFF/, "");
+    if (cleanKey !== key) {
+      process.env[cleanKey] = result.parsed![key];
+    }
+  }
+}
 
 const db = new Database("blue_intelligence.db");
 
@@ -387,22 +401,19 @@ async function fetchMarkdown(url: string): Promise<{ markdown: string, method: s
       throw new Error('Mdream result too short or empty');
     } catch (mdreamErr: any) {
       console.log(`[Web Reading] Mdream failed for ${url} (${mdreamErr.message}), switching to fallbacks...`);
-      
-      // Niveau 3: Jina Reader
-      if (process.env.JINA_READER_API_KEY) {
+
+      // Niveau 3: Firecrawl
+      if (process.env.FIRECRAWL_API_KEY) {
         try {
-          console.log(`[Web Reading] Trying Jina Reader for ${url}...`);
-          const jinaRes = await fetch(`https://r.jina.ai/${url}`, {
-            headers: { 'Authorization': `Bearer ${process.env.JINA_READER_API_KEY}` }
-          });
-          if (!jinaRes.ok) throw new Error(`Jina HTTP ${jinaRes.status}`);
-          const markdown = await jinaRes.text();
-          if (markdown && markdown.length > 500) {
-            return { markdown, method: 'Jina Reader' };
+          console.log(`[Web Reading] Trying Firecrawl for ${url}...`);
+          const firecrawl = new FirecrawlApp({ apiKey: process.env.FIRECRAWL_API_KEY });
+          const scrapeResult = await firecrawl.scrape(url, { formats: ['markdown'] }) as any;
+          if (!scrapeResult.success) {
+            throw new Error(scrapeResult.error || "Firecrawl scrape failed");
           }
-          throw new Error('Jina Reader result too short or empty');
-        } catch (jinaErr: any) {
-          console.log(`[Web Reading] Jina Reader failed for ${url} (${jinaErr.message})`);
+          return { markdown: scrapeResult.markdown || "", method: 'Firecrawl' };
+        } catch (firecrawlErr: any) {
+          console.log(`[Web Reading] Firecrawl failed for ${url} (${firecrawlErr.message})`);
         }
       }
 
@@ -424,62 +435,75 @@ async function fetchMarkdown(url: string): Promise<{ markdown: string, method: s
         }
       }
 
-      // Niveau 5: Firecrawl
-      if (process.env.FIRECRAWL_API_KEY) {
+      // Niveau 5: Jina Reader
+      if (process.env.JINA_READER_API_KEY) {
         try {
-          const firecrawl = new FirecrawlApp({ apiKey: process.env.FIRECRAWL_API_KEY });
-          const scrapeResult = await firecrawl.scrape(url, { formats: ['markdown'] }) as any;
-          if (!scrapeResult.success) {
-            throw new Error(scrapeResult.error || "Firecrawl scrape failed");
+          console.log(`[Web Reading] Trying Jina Reader for ${url}...`);
+          const jinaRes = await fetch(`https://r.jina.ai/${url}`, {
+            headers: { 'Authorization': `Bearer ${process.env.JINA_READER_API_KEY}` }
+          });
+          if (!jinaRes.ok) throw new Error(`Jina HTTP ${jinaRes.status}`);
+          const markdown = await jinaRes.text();
+          if (markdown && markdown.length > 500) {
+            return { markdown, method: 'Jina Reader' };
           }
-          return { markdown: scrapeResult.markdown || "", method: 'Firecrawl' };
-        } catch (firecrawlErr: any) {
-          console.log(`[Web Reading] Firecrawl failed for ${url} (${firecrawlErr.message})`);
-          throw new Error(`All extraction methods failed. Last error: ${firecrawlErr.message}`);
+          throw new Error('Jina Reader result too short or empty');
+        } catch (jinaErr: any) {
+          console.log(`[Web Reading] Jina Reader failed for ${url} (${jinaErr.message})`);
+          throw new Error(`All extraction methods failed. Last error: ${jinaErr.message}`);
         }
-      } else {
-        throw new Error(`All extraction methods failed. No API keys available for fallback.`);
       }
+      throw new Error(`All extraction methods failed. No API keys available for fallback.`);
     }
   }
 }
 
 async function extractProjectData(markdown: string, url: string) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("GEMINI_API_KEY is not configured");
-  
-  const ai = new GoogleGenAI({ apiKey });
+  const apiKey = process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error("CLAUDE_API_KEY (or ANTHROPIC_API_KEY) is not configured");
+
+  const client = new Anthropic({ apiKey });
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.1-flash-preview',
-      contents: `Extract the marine conservation project details from the following markdown content. The project URL is ${url}.\n\nMarkdown Content:\n${markdown}`,
-      config: {
-        temperature: 0,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING },
-            url: { type: Type.STRING },
-            description: { type: Type.STRING },
-            funder: { type: Type.STRING },
-            lat: { type: Type.NUMBER },
-            lng: { type: Type.NUMBER },
-            category: { type: Type.STRING },
-            status: { type: Type.STRING },
-            image_url: { type: Type.STRING },
-            start_date: { type: Type.STRING },
-            end_date: { type: Type.STRING }
-          },
-          required: ["title", "url", "description", "funder", "lat", "lng", "category", "status", "image_url"]
+    const response = await client.messages.create({
+      model: "claude-haiku-4-5",
+      max_tokens: 1024,
+      temperature: 0,
+      messages: [
+        {
+          role: "user",
+          content: `Extract the marine conservation project details from the following markdown content. The project URL is ${url}.\n\nMarkdown Content:\n${markdown}`
+        }
+      ],
+      output_config: {
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              url: { type: "string" },
+              description: { type: "string" },
+              funder: { type: "string" },
+              lat: { type: "number" },
+              lng: { type: "number" },
+              category: { type: "string" },
+              status: { type: "string" },
+              image_url: { type: "string" },
+              start_date: { type: "string" },
+              end_date: { type: "string" }
+            },
+            required: ["title", "url", "description", "funder", "lat", "lng", "category", "status", "image_url"],
+            additionalProperties: false
+          }
         }
       }
     });
-    
-    if (!response.text) throw new Error("Empty response from Gemini");
-    return JSON.parse(response.text);
+
+    const textBlock = response.content.find((block): block is { type: "text"; text: string } => block.type === "text");
+    if (!textBlock?.text) throw new Error("Empty response from Claude");
+    return JSON.parse(textBlock.text);
   } catch (err: any) {
-    throw new Error(`Gemini API Error: ${err.message}`);
+    throw new Error(`Claude API Error: ${err.message}`);
   }
 }
 
@@ -564,7 +588,9 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
     const runData = await response.json();
     const safeRunData = { ...runData };
     if (safeRunData.error === null) delete safeRunData.error;
-    console.log(`[TinyFish] Initial Run Data:`, JSON.stringify(safeRunData));
+    if (process.env.DEBUG_TINYFISH) {
+      console.log(`[TinyFish] Initial Run Data:`, JSON.stringify(safeRunData));
+    }
     
     if ((!runData.id && !runData.run_id) || (runData.error && runData.error !== null)) {
       console.error(`[TinyFish] Failed to start run for ${targetUrl}. Full Response:`, JSON.stringify(runData));
@@ -808,6 +834,18 @@ async function startServer() {
 
   app.use(express.json());
 
+  // Request logging (API routes only)
+  app.use((req, res, next) => {
+    if (req.path.startsWith("/api/")) {
+      const start = Date.now();
+      res.on("finish", () => {
+        const duration = Date.now() - start;
+        console.log(`[API] ${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
+      });
+    }
+    next();
+  });
+
   // API Routes
   app.get("/api/debug/db", (req, res) => {
     try {
@@ -822,7 +860,8 @@ async function startServer() {
   app.get("/api/config-check", (req, res) => {
     res.json({
       tinyfishKeySet: !!process.env.TINYFISH_API_KEY,
-      envKeys: Object.keys(process.env).filter(k => k.includes('FISH') || k.includes('API') || k.includes('KEY') || k.includes('TINY'))
+      claudeKeySet: !!(process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_API_KEY),
+      envKeys: Object.keys(process.env).filter(k => k.includes('FISH') || k.includes('API') || k.includes('KEY') || k.includes('TINY') || k.includes('CLAUDE') || k.includes('ANTHROPIC'))
     });
   });
 
@@ -1044,7 +1083,13 @@ async function startServer() {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
     const tfKey = process.env.TINYFISH_API_KEY;
+    const claudeKey = process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_API_KEY;
+    const geminiKey = process.env.GEMINI_API_KEY;
     console.log(`[Startup] TinyFish API Key: ${tfKey ? tfKey.substring(0, 4) + '...' : 'MISSING'}`);
+    console.log(`[Startup] Claude API Key: ${claudeKey ? claudeKey.substring(0, 8) + '...' : 'MISSING'}`);
+    if (geminiKey && !claudeKey) {
+      console.log(`[Startup] ⚠️  GEMINI_API_KEY est défini mais l'app utilise CLAUDE_API_KEY.`);
+    }
   });
 }
 
