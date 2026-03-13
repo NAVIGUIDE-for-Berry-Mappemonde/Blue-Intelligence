@@ -16,6 +16,23 @@ const LS_PROJECTS_CLEARED = "blueintel_projectsCleared";
 // Évite double "Ready" sous React StrictMode (effet exécuté 2× en dev)
 let hasLoggedReady = false;
 
+/** Translate log payload from server (key + params) to localized string */
+function translateLog(data: Record<string, unknown>, t: Record<string, unknown>): string {
+  const key = data.key as string;
+  if (!key || !(t as any).logs?.[key]) return (data.message as string) || JSON.stringify(data);
+  let template = ((t as any).logs as Record<string, string>)[key];
+  const params = { ...data };
+  delete params.key;
+  if (params.modeKey) {
+    params.mode = ((t as any).logs as Record<string, string>)[params.modeKey as string] || params.modeKey;
+    delete params.modeKey;
+  }
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null) template = template.replace(new RegExp(`\\{${k}\\}`, "g"), String(v));
+  }
+  return template;
+}
+
 // Zoom-based marker limits: fewer markers when zoomed out for performance
 const ZOOM_LIMITS = [
   { maxZoom: 5, maxMarkers: 200 },
@@ -291,10 +308,10 @@ export default function App() {
       console.error("Failed to fetch config status:", error);
     }
   };
+  const [targetMode, setTargetMode] = useState<"test" | "full">("test");
   const [selectedFunderFilter, setSelectedFunderFilter] = useState<string>("All");
   const [telemetry, setTelemetry] = useState<any[]>([]);
   const [failedExtractions, setFailedExtractions] = useState<any[]>([]);
-  const [targetMode, setTargetMode] = useState<string>("test");
   const [activeRuns, setActiveRuns] = useState<any[]>([]);
   const [selectedProxy, setSelectedProxy] = useState<string>("");
   const [clearBeforeStart, setClearBeforeStart] = useState(false);
@@ -498,9 +515,9 @@ export default function App() {
   useEffect(() => {
     if (!hasLoggedReady) {
       hasLoggedReady = true;
-      appendAgentLog("Ready");
+      appendAgentLog((t as any).logs?.ready || "Ready");
     }
-  }, [appendAgentLog]);
+  }, [appendAgentLog, t]);
 
   useEffect(() => {
     mainLogRef.current?.scrollTo({ top: mainLogRef.current.scrollHeight, behavior: "smooth" });
@@ -530,8 +547,9 @@ export default function App() {
     const logEs = new EventSource("/api/logs/stream");
     logEs.onmessage = (e) => {
       try {
-        const data = JSON.parse(e.data);
-        if (data?.message) appendAgentLog(data.message);
+        const data = JSON.parse(e.data) as Record<string, unknown>;
+        const msg = data?.key ? translateLog(data, t) : (data?.message as string);
+        if (msg) appendAgentLog(msg);
       } catch (_) {}
     };
     const es = new EventSource("/api/projects/stream");
@@ -540,7 +558,7 @@ export default function App() {
         if (projectsClearedRef.current || localStorage.getItem(LS_PROJECTS_CLEARED) === "1") return;
         const feature = JSON.parse(e.data);
         const title = feature?.properties?.title || feature?.properties?.url || "—";
-        appendAgentLog(`Project added: ${String(title).slice(0, 40)}${String(title).length > 40 ? "…" : ""}`);
+        appendAgentLog(((t as any).logs?.project_added || "Project added: {title}").replace("{title}", String(title).slice(0, 40) + (String(title).length > 40 ? "…" : "")));
         setProjects((prev: any) => ({ ...prev, features: [...(prev.features || []), feature] }));
       } catch (_) {}
     };
@@ -557,7 +575,7 @@ export default function App() {
       clearInterval(interval);
       Object.values(eventSources.current).forEach((ev: any) => ev.close());
     };
-  }, [appendAgentLog]);
+  }, [appendAgentLog, t]);
 
   const deploySwarm = async () => {
     if (isSwarmRunning) return; // Prevent double deploy
@@ -566,7 +584,7 @@ export default function App() {
     swarmStoppedRef.current = false;
     projectsClearedRef.current = false;
     setLoading(true);
-    appendAgentLog(`ETL Swarm deploying (MasterSeeds + DeepLinkCache)...`);
+    appendAgentLog((t as any).logs?.deploy_start || "ETL Swarm deploying (MasterSeeds + DeepLinkCache)...");
     try {
       const res = await fetch("/api/etl/swarm-deploy", {
         method: "POST",
@@ -583,12 +601,12 @@ export default function App() {
         }),
       });
       const data = await res.json();
-      appendAgentLog(data.message || `Swarm deployed. ${data.enqueued || 0} tasks.`);
+      appendAgentLog(data.message || ((t as any).logs?.deploy_ok || "Swarm deployed. {n} tasks.").replace("{n}", String(data.enqueued || 0)));
       // Optimistic update: prevent double deploy and show Stop button immediately
       setQueueStatus(prev => ({ active: prev.active, queued: prev.queued + (data.enqueued || 0) }));
     } catch (error) {
       console.error("Failed to deploy swarm:", error);
-      appendAgentLog("Swarm deploy failed.");
+      appendAgentLog((t as any).logs?.deploy_fail || "Swarm deploy failed.");
     } finally {
       setLoading(false);
     }
@@ -603,10 +621,10 @@ export default function App() {
       Object.values(eventSources.current).forEach(es => es.close());
       eventSources.current = {};
       await fetch("/api/agent/stop", { method: "POST", cache: "no-store" });
-      appendAgentLog("Swarm stopped. Queue cleared.");
+      appendAgentLog((t as any).logs?.swarm_stopped || "Swarm stopped. Queue cleared.");
     } catch (error) {
       console.error("Failed to stop swarm:", error);
-      appendAgentLog("Stop swarm failed.");
+      appendAgentLog((t as any).logs?.stop_fail || "Stop swarm failed.");
       swarmStoppedRef.current = false;
       localStorage.removeItem(LS_SWARM_STOPPED);
     } finally {
@@ -627,7 +645,7 @@ export default function App() {
       eventSources.current = {};
       const res = await fetch("/api/projects/clear", { method: "POST", cache: "no-store" });
       if (res.ok) {
-        appendAgentLog("Database cleared. Cache removed.");
+        appendAgentLog((t as any).logs?.db_cleared_cache || "Database cleared. Cache removed.");
       } else {
         projectsClearedRef.current = false;
         swarmStoppedRef.current = false;
@@ -789,12 +807,12 @@ export default function App() {
                 <div className="grid grid-cols-2 gap-2 mb-2">
                   <select 
                     value={targetMode}
-                    onChange={(e) => setTargetMode(e.target.value)}
+                    onChange={(e) => setTargetMode(e.target.value as "test" | "full")}
                     disabled={loading}
                     className={`${leftSidebar.input} rounded-lg p-2 text-xs outline-none disabled:opacity-50 border`}
                     title={helpMode ? t.targetModeHelp : undefined}
                   >
-                    <option value="test">Test ({Math.max(2, config.agent.maxConcurrentAgents)})</option>
+                    <option value="test">Test ({Math.min(2, Math.max(1, config.agent.maxConcurrentAgents ?? 2))})</option>
                     <option value="full">{t.fullMode} ({seeds.length})</option>
                   </select>
                   <select 
@@ -1100,7 +1118,7 @@ export default function App() {
                             config: { gatekeeper: config.gatekeeper, extraction: config.extraction },
                           }),
                         });
-                        appendAgentLog(`Forced extraction queued for ${failedExtractions.length} URLs`);
+                        appendAgentLog(((t as any).logs?.force_extract_queued || "Forced extraction queued for {n} URLs").replace("{n}", String(failedExtractions.length)));
                       } catch (error) {
                         console.error("Failed to queue forced extraction:", error);
                       }
@@ -1159,7 +1177,7 @@ export default function App() {
                                       config: { gatekeeper: config.gatekeeper, extraction: config.extraction },
                                     }),
                                   });
-                                  appendAgentLog(`Forced extraction queued for ${f.project_url}`);
+                                  appendAgentLog(((t as any).logs?.force_extract_queued || "Forced extraction queued for {n} URLs").replace("{n}", "1"));
                                 } catch (error) {
                                   console.error("Failed to queue forced extraction:", error);
                                 }

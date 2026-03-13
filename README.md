@@ -70,10 +70,7 @@ npm install
 # - TINYFISH_API_KEY (required for extraction)
 # - CLAUDE_API_KEY or ANTHROPIC_API_KEY (required for analysis)
 
-# 3. Optional: download GSHHG data (land/sea mask)
-npm run download-gshhg
-
-# 4. Run the application
+# 3. Run the application (GSHHG crude is embedded, no download needed)
 npm run dev
 ```
 

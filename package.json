@@ -15,7 +15,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "download-gshhg": "tsx scripts/download-gshhg.ts"
+    "download-gshhg": "tsx scripts/download-gshhg.ts",
+    "embed-gshhg": "node scripts/embed-gshhg.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

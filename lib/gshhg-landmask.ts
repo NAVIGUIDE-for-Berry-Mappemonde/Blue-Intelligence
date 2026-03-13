@@ -4,15 +4,15 @@
  * Utilise GSHHS (Global Self-consistent, Hierarchical, High-resolution Shorelines)
  * maintenu par NOAA. Niveau L1 (frontière terre/océan).
  *
- * Résolutions: crude (~25km, ~300KB), low (~5km, ~1MB), high (~200m, ~25MB)
- * Par défaut: "crude" pour permettre l'embarquement dans l'app (pas de téléchargement).
+ * Résolution crude: embarquée dans le code (pas de téléchargement).
+ * Autres résolutions: charger depuis data/gshhg/ (npm run download-gshhg).
  *
  * Format binaire: https://www.ngdc.noaa.gov/mgg/shorelines/data/gshhg/readme.txt
- * Fichier: gshhs_{c,l,i,h,f}_l1.b (c=crude, l=low, i=intermediate, h=high, f=full)
  */
 
 import fs from "fs";
 import path from "path";
+import { GSHHG_CRUDE_B64 } from "./gshhg-data.js";
 
 const MICRO = 1e-6; // micro-degrees to degrees
 
@@ -68,25 +68,12 @@ const RESOLUTION_MAP: Record<string, string> = {
 const RESOLUTION_LETTER = RESOLUTION_MAP[GSHHG_RESOLUTION] ?? "c";
 
 /**
- * Charge les polygones L1 (terre) depuis le fichier binaire GSHHG.
- * Supporte format 1.2 (36 bytes header, crude direct) et 2.x (44 bytes header).
+ * Parse les polygones L1 depuis un buffer binaire GSHHG.
+ * Supporte format 1.2 (36 bytes header, crude) et 2.x (44 bytes header).
  */
-function loadGSHHGL1Polygons(filePath: string): GSHHGPolygon[] {
-  if (cachedPolygons) return cachedPolygons;
-
-  if (!fs.existsSync(filePath)) {
-    console.warn(`[GSHHG] Fichier non trouvé: ${filePath}. Exécutez: npm run download-gshhg`);
-    cachedPolygons = [];
-    return [];
-  }
-
-  const buf = fs.readFileSync(filePath);
+function parseGSHHGL1Polygons(buf: Buffer, isV12: boolean): GSHHGPolygon[] {
   const polygons: GSHHGPolygon[] = [];
   let offset = 0;
-
-  // Format 1.2 (crude direct download): header 36 bytes
-  // Format 2.x (zip): header 44 bytes
-  const isV12 = path.basename(filePath) === "gshhs_c_l1.b";
   const HEADER_SIZE = isV12 ? 36 : 44;
 
   while (offset + HEADER_SIZE <= buf.length) {
@@ -118,9 +105,34 @@ function loadGSHHGL1Polygons(filePath: string): GSHHGPolygon[] {
     }
   }
 
-  console.log(`[GSHHG] Chargé ${polygons.length} polygones L1 (terre) depuis ${path.basename(filePath)}`);
-  cachedPolygons = polygons;
   return polygons;
+}
+
+/**
+ * Charge les polygones L1 (terre). Crude = embarqué. Autres = fichier.
+ */
+function loadGSHHGL1Polygons(): GSHHGPolygon[] {
+  if (cachedPolygons) return cachedPolygons;
+
+  if (RESOLUTION_LETTER === "c") {
+    const buf = Buffer.from(GSHHG_CRUDE_B64, "base64");
+    cachedPolygons = parseGSHHGL1Polygons(buf, true);
+    console.log(`[GSHHG] Chargé ${cachedPolygons.length} polygones L1 (terre) depuis données embarquées`);
+    return cachedPolygons;
+  }
+
+  const dataDir = path.join(process.cwd(), "data", "gshhg");
+  const filePath = path.join(dataDir, `gshhs_${RESOLUTION_LETTER}_l1.b`);
+  if (!fs.existsSync(filePath)) {
+    console.warn(`[GSHHG] Fichier non trouvé: ${filePath}. Exécutez: npm run download-gshhg -- --resolution=${GSHHG_RESOLUTION}`);
+    cachedPolygons = [];
+    return [];
+  }
+
+  const buf = fs.readFileSync(filePath);
+  cachedPolygons = parseGSHHGL1Polygons(buf, false);
+  console.log(`[GSHHG] Chargé ${cachedPolygons.length} polygones L1 (terre) depuis ${path.basename(filePath)}`);
+  return cachedPolygons;
 }
 
 /**
@@ -128,10 +140,7 @@ function loadGSHHGL1Polygons(filePath: string): GSHHGPolygon[] {
  * Basé sur GSHHS L1 (résolution configurée via GSHHG_RESOLUTION, défaut: crude).
  */
 export function isPointOnLand(lat: number, lng: number): boolean {
-  const dataDir = path.join(process.cwd(), "data", "gshhg");
-  const filePath = path.join(dataDir, `gshhs_${RESOLUTION_LETTER}_l1.b`);
-
-  const polygons = loadGSHHGL1Polygons(filePath);
+  const polygons = loadGSHHGL1Polygons();
   if (polygons.length === 0) return false; // Fallback: considérer comme mer si pas de données
 
   for (const p of polygons) {
@@ -154,9 +163,7 @@ export function isInland(lat: number, lng: number): boolean {
  * Utilisé pour la distance paramétrable : « projet marin toléré jusqu'à X km de la mer ».
  */
 export function distanceToCoastKm(lat: number, lng: number): number {
-  const dataDir = path.join(process.cwd(), "data", "gshhg");
-  const filePath = path.join(dataDir, `gshhs_${RESOLUTION_LETTER}_l1.b`);
-  const polygons = loadGSHHGL1Polygons(filePath);
+  const polygons = loadGSHHGL1Polygons();
   if (polygons.length === 0) return 0;
 
   let minDist = Infinity;

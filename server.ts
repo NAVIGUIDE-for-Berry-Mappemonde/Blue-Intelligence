@@ -252,18 +252,18 @@ async function runExtractOnly(projectUrl: string, taskConfig?: TaskConfig): Prom
   if (swarmStopped) return 0;
   try {
     const host = (() => { try { return new URL(projectUrl).hostname; } catch { return projectUrl.slice(0, 30); } })();
-    broadcastLog(`[ETL] Fetch → ${host}`);
+    broadcastLog({ key: "etl_fetch", host });
     const { markdown, method } = await fetchMarkdown(projectUrl);
     const projectData = await extractProjectData(markdown, projectUrl, taskConfig?.extraction);
     if (swarmStopped) return 0;
     const gatekeeper = passesMarineGatekeeper(projectData, taskConfig?.gatekeeper);
     if (!gatekeeper.pass) {
-      broadcastLog(`[ETL] Gatekeeper rejected → ${host}`);
+      broadcastLog({ key: "etl_gatekeeper_rejected", host });
       console.log(`[Gatekeeper] REJECTED ${projectUrl}: ${gatekeeper.reason}`);
       return 0;
     }
     const relevanceScore = typeof projectData.marine_relevance === "number" ? projectData.marine_relevance : 0.95;
-    broadcastLog(`[ETL] Claude extract → ${(projectData.title || "?").slice(0, 40)}`);
+    broadcastLog({ key: "etl_claude_extract", title: (projectData.title || "?").slice(0, 40) });
     const upsertResult = upsertProject({
       title: projectData.title || "Unknown",
       url: projectData.url || projectUrl,
@@ -280,7 +280,7 @@ async function runExtractOnly(projectUrl: string, taskConfig?: TaskConfig): Prom
       s_ocean_score: projectData.s_ocean_score ?? 0.75,
     });
     if (upsertResult !== "skipped") {
-      broadcastLog(`[ETL] Saved → ${(projectData.title || "?").slice(0, 35)}`);
+      broadcastLog({ key: "etl_saved", title: (projectData.title || "?").slice(0, 35) });
     }
     return upsertResult !== "skipped" ? 1 : 0;
   } catch (err: any) {
@@ -296,7 +296,7 @@ function processQueue() {
     const mode = task.mode || "discover";
     const shortUrl = task.url.length > 45 ? task.url.slice(0, 42) + "…" : task.url;
     if (mode === "extract") {
-      broadcastLog(`[ETL] Extract-only → ${shortUrl}`);
+      broadcastLog({ key: "etl_extract_only", url: shortUrl });
     }
     (async () => {
       try {
@@ -312,7 +312,7 @@ function processQueue() {
         processQueue();
         if (deployStartTime && activeAgents === 0 && agentQueue.length === 0) {
           const elapsedSec = ((Date.now() - deployStartTime) / 1000).toFixed(1);
-          broadcastLog(`[ETL] Swarm terminé en ${elapsedSec}s`);
+          broadcastLog({ key: "etl_swarm_done", sec: elapsedSec });
           console.log(`[Swarm] Process completed in ${elapsedSec}s`);
           deployStartTime = null;
         }
@@ -976,14 +976,15 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
     const label = `TinyFish ${agentCounter}`;
     activeRuns.set(runId, { streamingUrl, logs: [], status: runData.status || "PENDING", targetUrl, mode, agentLabel: label });
     const shortUrl = targetUrl.length > 50 ? targetUrl.slice(0, 47) + "…" : targetUrl;
-    broadcastLog(`[Swarm] ${label} dispatched → ${shortUrl}`);
-    broadcastLog(`[${label}] ${mode === "extract" ? "Extract" : "Discovery"} browsing → ${shortUrl}`);
+    broadcastLog({ key: "swarm_dispatched", label, url: shortUrl });
+    broadcastLog({ key: "swarm_browsing", label, modeKey: mode === "extract" ? "extract" : "discovery", url: shortUrl });
 
     // 3. Poll for completion (or we could use SSE, but for the backend poll is safer for DB update)
     let status = runData.status || "PENDING";
     let result = null;
     let pendingStartTime = Date.now();
-    const PENDING_TIMEOUT_MS = 300000; // 5 minutes timeout for PENDING state
+    const PENDING_TIMEOUT_MS = 120000; // 2 minutes: free slot if TinyFish never starts
+    let lastPendingLog = 0;
     
     while (status === "RUNNING" || status === "PENDING") {
       // Check if run was aborted
@@ -996,8 +997,14 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
       // Safety timeout for PENDING state
       const timeInPending = Date.now() - pendingStartTime;
       if (status === "PENDING" && (timeInPending > PENDING_TIMEOUT_MS)) {
-        console.error(`[TinyFish] Run ${runId} timed out in PENDING state after ${Math.round(timeInPending/1000)}s.`);
-        throw new Error("Agent timed out while waiting to start (PENDING state too long). This usually happens when the agent provider is under high load.");
+        console.error(`[TinyFish] Run ${runId} timed out in PENDING state after ${Math.round(timeInPending/1000)}s. Freeing slot.`);
+        activeRuns.delete(runId);
+        throw new Error("Agent timed out while waiting to start (PENDING state too long). Slot freed for next task.");
+      }
+      // Log PENDING at most every 30s to avoid spam
+      if (status === "PENDING" && (Date.now() - lastPendingLog > 30000)) {
+        lastPendingLog = Date.now();
+        console.log(`[TinyFish] Run ${runId} still PENDING (${Math.round(timeInPending/1000)}s). Timeout in ${Math.round((PENDING_TIMEOUT_MS - timeInPending)/1000)}s.`);
       }
 
       await new Promise(resolve => setTimeout(resolve, 5000));
@@ -1025,12 +1032,12 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
           activeRuns.set(runId, { ...currentRun, status: status });
         }
         
-        if (status !== "RUNNING") {
+        if (status !== "RUNNING" && status !== "PENDING") {
           console.log(`[TinyFish] Run ${runId} status: ${status}`);
         }
         
         if (status === "COMPLETED") {
-          broadcastLog(`[${label}] ${mode === "extract" ? "Extract" : "Discovery"} complete`);
+          broadcastLog({ key: "swarm_complete", label, modeKey: mode === "extract" ? "extract" : "discovery" });
           const safeStatusData = { ...statusData };
           if (safeStatusData.error === null) delete safeStatusData.error;
           if (safeStatusData.steps) delete safeStatusData.steps;
@@ -1117,9 +1124,9 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
           
           projectsFound = upsertResult !== "skipped" ? 1 : 0;
           if (upsertResult !== "skipped") {
-            broadcastLog(`[ETL] Saved → ${(projectData.title || "?").slice(0, 35)}`);
+            broadcastLog({ key: "etl_saved", title: (projectData.title || "?").slice(0, 35) });
           }
-          broadcastLog(`[ETL] Extract complete: ${projectsFound} project saved`);
+          broadcastLog({ key: projectsFound === 1 ? "etl_extract_one" : "etl_extract_many", n: projectsFound });
           console.log(`[TinyFish] Extraction mode finished successfully for ${targetUrl}`);
         } catch (err: any) {
           console.error(`[TinyFish] Error parsing extraction result for ${targetUrl}:`, err.message);
@@ -1134,8 +1141,8 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
           return;
         }
         const extractConcurrency = taskConfig?.extraction?.concurrency ?? EXTRACT_CONCURRENCY;
-        broadcastLog(`[ETL] DeepLinkCache updated (+${urls.length} pages)`);
-        broadcastLog(`[ETL] Extraction pipeline: ${urls.length} URLs (concurrency=${extractConcurrency})`);
+        broadcastLog({ key: "etl_cache_updated", n: urls.length });
+        broadcastLog({ key: "etl_pipeline", n: urls.length, c: extractConcurrency });
         console.log(`[TinyFish] Discovered ${urls.length} URLs for ${targetUrl}. Starting hybrid extraction (concurrency=${extractConcurrency})...`);
         // ETL: Inject into structural memory
         appendToDeepLinkCache("DeepLinkCacheProjectsLists.json", [targetUrl]);
@@ -1145,7 +1152,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
           if (swarmStopped || activeRuns.get(runId)?.aborted) return 0;
           try {
             const host = (() => { try { return new URL(projectUrl).hostname; } catch { return projectUrl.slice(0, 30); } })();
-            broadcastLog(`[ETL] Fetch ${i + 1}/${urls.length}: ${host}`);
+            broadcastLog({ key: "etl_fetch_n", i: i + 1, total: urls.length, host });
             const { markdown, method } = await fetchMarkdown(projectUrl);
             const projectData = await extractProjectData(markdown, projectUrl, taskConfig?.extraction);
 
@@ -1166,7 +1173,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
 
             if (swarmStopped) return 0;
             const relevanceScore = typeof projectData.marine_relevance === "number" ? projectData.marine_relevance : 0.95;
-            broadcastLog(`[ETL] Claude extract → ${(projectData.title || "?").slice(0, 40)}`);
+            broadcastLog({ key: "etl_claude_extract", title: (projectData.title || "?").slice(0, 40) });
             const upsertResult = upsertProject({
               title: projectData.title || 'Unknown',
               url: projectData.url || projectUrl,
@@ -1188,7 +1195,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
             } catch (e) {}
             
             if (upsertResult !== "skipped") {
-              broadcastLog(`[ETL] Saved → ${(projectData.title || "?").slice(0, 35)}`);
+              broadcastLog({ key: "etl_saved", title: (projectData.title || "?").slice(0, 35) });
             }
             console.log(`[Extraction] ${i+1}/${urls.length} URL traitée via (${method}) [marine=${relevanceScore.toFixed(2)}]${upsertResult === "updated" ? " [dédoublonné]" : ""}: ${projectUrl}`);
             return upsertResult !== "skipped" ? 1 : 0;
@@ -1213,7 +1220,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
           return;
         }
         projectsFound = successCount;
-        broadcastLog(`[ETL] Extraction complete: ${projectsFound} projects saved`);
+        broadcastLog({ key: projectsFound === 1 ? "etl_extract_one" : "etl_extract_many", n: projectsFound });
         console.log(`[TinyFish] Hybrid extraction finished. Saved ${projectsFound} projects for ${targetUrl}`);
       }
     }
@@ -1239,9 +1246,11 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
 }
 
 // Log stream for frontend (informative process logs)
+// Supports: broadcastLog("raw") or broadcastLog({ key: "etl_fetch", host: "x.com" })
 const logStreamSubscribers: { res: express.Response }[] = [];
-function broadcastLog(msg: string) {
-  const line = JSON.stringify({ message: msg }) + "\n";
+function broadcastLog(msg: string | Record<string, unknown>) {
+  const payload = typeof msg === "string" ? { message: msg } : { ...msg };
+  const line = JSON.stringify(payload) + "\n";
   for (let i = logStreamSubscribers.length - 1; i >= 0; i--) {
     try {
       logStreamSubscribers[i].res.write(`data: ${line}`);
@@ -1384,7 +1393,7 @@ async function startServer() {
       agentCounter = 0;
       activeRuns.clear(); // Remove all runs so agent numbering resets on next deploy
       db.prepare("DELETE FROM projects").run();
-      broadcastLog("[ETL] Database cleared");
+      broadcastLog({ key: "etl_db_cleared" });
       res.json({ status: "ok", message: "All projects cleared" });
     } catch (error) {
       console.error("Error clearing projects:", error);
@@ -1476,20 +1485,20 @@ async function startServer() {
     swarmStopped = false;
     deployStartTime = Date.now();
     maxConcurrentAgents = Math.max(1, Math.min(2, config?.agent?.maxConcurrentAgents ?? 2));
-    broadcastLog("[ETL] Swarm deploy starting...");
+    broadcastLog({ key: "etl_deploy_start" });
     agentQueue.length = 0;
     activeAgents = 0; // Reset so processQueue can start new tasks immediately
     agentCounter = 0; // Fresh start: agent numbering begins at 1
     activeRuns.clear();
     if (clearBeforeStart) {
       db.prepare("DELETE FROM projects").run();
-      broadcastLog("[ETL] Database cleared");
+      broadcastLog({ key: "etl_db_cleared" });
     }
     const seeds = loadMasterSeeds();
     const lists = loadDeepLinkCache("DeepLinkCacheProjectsLists.json");
     const pages = loadDeepLinkCache("DeepLinkCacheProjectsPages.json");
-    broadcastLog(`[ETL] MasterSeeds: ${seeds.length} foundations`);
-    broadcastLog(`[ETL] DeepLinkCache: ${lists.urls.length} lists, ${pages.urls.length} pages`);
+    broadcastLog({ key: "etl_master_seeds", n: seeds.length });
+    broadcastLog({ key: "etl_deeplink", lists: lists.urls.length, pages: pages.urls.length });
     const existingUrls = new Set(
       (db.prepare("SELECT url FROM projects WHERE url IS NOT NULL").all() as { url: string }[]).map(r => r.url)
     );
@@ -1513,11 +1522,11 @@ async function startServer() {
     }
     const nDiscover = toEnqueue.filter(t => t.mode === "discover").length;
     const nExtract = toEnqueue.filter(t => t.mode === "extract").length;
-    broadcastLog(`[ETL] Queue: ${nDiscover} discover + ${nExtract} extract = ${toEnqueue.length} tasks`);
+    broadcastLog({ key: "etl_queue", discover: nDiscover, extract: nExtract, total: toEnqueue.length });
     for (const t of toEnqueue) {
       agentQueue.push(t);
     }
-    broadcastLog(`[ETL] ${toEnqueue.length} tasks enqueued → Swarm`);
+    broadcastLog({ key: "etl_enqueued", n: toEnqueue.length });
     console.log(`[Swarm] Deploy: ${toEnqueue.length} tasks enqueued (${nDiscover} discover, ${nExtract} extract)`);
     processQueue();
     res.json({
@@ -1600,7 +1609,7 @@ async function startServer() {
   });
 
   app.post("/api/agent/stop", (req, res) => {
-    broadcastLog("[Swarm] Stop requested");
+    broadcastLog({ key: "swarm_stop" });
     swarmStopped = true;
     deployStartTime = null;
     agentQueue.length = 0;

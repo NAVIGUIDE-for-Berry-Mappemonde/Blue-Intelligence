@@ -15,6 +15,9 @@ export default defineConfig({
     },
     server: {
       hmr: process.env.DISABLE_HMR !== 'true',
+      watch: {
+        ignored: ['**/data/**', '**/blue_intelligence.db', '**/*.db'],
+      },
     },
   }
 );

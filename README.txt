@@ -106,7 +106,7 @@ FONCTIONNALITÉS PRINCIPALES
   D. Filtrage GSHHG
      • Masque terre/mer basé sur NOAA GSHHG (Global Self-consistent Hierarchical
        High-resolution Geography)
-     • Résolution « crude » par défaut
+     • Résolution « crude » embarquée par défaut (pas de téléchargement)
      • Distance à la côte paramétrable pour inclure les projets côtiers
 
   E. Base de données
@@ -251,7 +251,7 @@ RABIA NAZ
 
 • TinyFish API (agent web autonome)
 • Anthropic Claude (extraction, gatekeeper, scoring)
-• NOAA GSHHG (masque terre/mer)
+• NOAA GSHHG (masque terre/mer, crude embarqué)
 • Leaflet, MapLibre, React
 • Mozilla Readability, Mdream, Firecrawl, Turndown
 • better-sqlite3, Express, Vite
@@ -275,8 +275,10 @@ INSTALLATION
    - TINYFISH_API_KEY (obligatoire pour ETL)
    - CLAUDE_API_KEY ou ANTHROPIC_API_KEY (obligatoire pour extraction)
    - FIRECRAWL_API_KEY, SCRAPE_DO_API_KEY, JINA_READER_API_KEY (optionnels)
-4. npm run download-gshhg (télécharge les données GSHHG)
-5. npm run dev (lance le serveur sur http://localhost:3000)
+4. npm run dev (lance le serveur sur http://localhost:3000)
+
+Note : GSHHG crude est embarqué ; pas de téléchargement requis. Pour low/
+intermediate/high/full : npm run download-gshhg -- --resolution=low
 
 UTILISATION
 -----------
