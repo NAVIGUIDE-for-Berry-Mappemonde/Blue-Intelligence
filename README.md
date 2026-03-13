@@ -2,7 +2,7 @@
 
 # Blue Intelligence
 
-**Maritime OSINT Swarm** — Cartographie autonome des projets de conservation marine
+**Maritime OSINT Swarm** — Autonomous mapping of marine conservation projects
 
 <br />
 
@@ -24,7 +24,7 @@
       <br />
       <strong>NAVIGUIDE</strong>
       <br />
-      <sub>Navigation intelligente</sub>
+      <sub>Intelligent navigation</sub>
     </td>
     <td align="center" width="33%">
       <a href="https://berrymappemonde.org" target="_blank" rel="noreferrer">
@@ -33,55 +33,55 @@
       <br />
       <strong>Berry-Mappemonde</strong>
       <br />
-      <sub>Expédition maritime</sub>
+      <sub>Maritime expedition</sub>
     </td>
   </tr>
 </table>
 
 <br />
 
-*Module Impact de l'écosystème NAVIGUIDE — 45 000 milles nautiques, 13 territoires d'outre-mer*
+*Impact module of the NAVIGUIDE ecosystem — 45,000 nautical miles, 13 overseas territories*
 
 </div>
 
 ---
 
-## À propos
+## About
 
-**Blue Intelligence** transforme le web vivant des données maritimes en une base géospatiale exécutable. L'application déploie des agents IA (TinyFish + Claude) pour découvrir, extraire et cartographier les projets de conservation marine à travers le monde.
+**Blue Intelligence** transforms the living web of maritime data into an executable geospatial database. The application deploys AI agents (TinyFish + Claude) to discover, extract, and map marine conservation projects worldwide.
 
-- 🗺️ **Carte interactive** — Projets en GeoJSON, clusters, filtres par financeur
-- 🤖 **Swarm ETL** — Découverte autonome via MasterSeeds + DeepLinkCache
-- 🌊 **Pipeline 3 étapes** — Haiku gatekeeper → Sonnet extract → S_ocean scoring
-- 📍 **Coastal snapping** — Coordonnées recalculées vers les zones maritimes
-- 🔄 **100 % local** — SQLite, tourne entièrement sur votre machine
+- 🗺️ **Interactive map** — GeoJSON projects, clusters, filters by funder
+- 🤖 **ETL Swarm** — Autonomous discovery via MasterSeeds + DeepLinkCache
+- 🌊 **3-stage pipeline** — Haiku gatekeeper → Sonnet extract → S_ocean scoring
+- 📍 **Coastal snapping** — Coordinates recalculated to maritime zones
+- 🔄 **100% local** — SQLite, runs entirely on your machine
 
 ---
 
-## Démarrage rapide
+## Quick start
 
-**Prérequis :** Node.js 18+
+**Prerequisites:** Node.js 18+
 
 ```bash
-# 1. Installer les dépendances
+# 1. Install dependencies
 npm install
 
-# 2. Configurer les clés API (copier .env.example vers .env)
-# - TINYFISH_API_KEY (obligatoire pour l'extraction)
-# - CLAUDE_API_KEY ou ANTHROPIC_API_KEY (obligatoire pour l'analyse)
+# 2. Configure API keys (copy .env.example to .env)
+# - TINYFISH_API_KEY (required for extraction)
+# - CLAUDE_API_KEY or ANTHROPIC_API_KEY (required for analysis)
 
-# 3. Optionnel : télécharger les données GSHHG (masque terre/mer)
+# 3. Optional: download GSHHG data (land/sea mask)
 npm run download-gshhg
 
-# 4. Lancer l'application
+# 4. Run the application
 npm run dev
 ```
 
-Ouvrez [http://localhost:3000](http://localhost:3000).
+Open [http://localhost:3000](http://localhost:3000).
 
 ---
 
-## Liens
+## Links
 
 | | |
 |---|---|
@@ -93,6 +93,6 @@ Ouvrez [http://localhost:3000](http://localhost:3000).
 
 <div align="center">
 
-*Blue Intelligence — Maritime OSINT Swarm pour NAVIGUIDE et Berry-Mappemonde*
+*Blue Intelligence — Maritime OSINT Swarm for NAVIGUIDE and Berry-Mappemonde*
 
 </div>
