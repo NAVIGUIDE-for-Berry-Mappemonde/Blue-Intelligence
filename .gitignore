@@ -1,8 +1,16 @@
 node_modules/
 build/
+# GSHHG: on committe gshhs_c_l1.b (crude ~300KB), on ignore le zip et les grosses résolutions
+data/gshhg/*.zip
+data/gshhg/gshhs_h_l1.b
+data/gshhg/gshhs_f_l1.b
+data/gshhg/gshhs_i_l1.b
 dist/
 coverage/
 .DS_Store
 *.log
 .env*
 !.env.example
+blue_intelligence.db
+react-example@0.0.0
+tsx

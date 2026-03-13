@@ -9,6 +9,7 @@ import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
 import Anthropic from "@anthropic-ai/sdk";
+import { isInland as isInlandGSHHG, distanceToCoastKm } from "./lib/gshhg-landmask.js";
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
@@ -19,12 +20,13 @@ process.on('unhandledRejection', (reason, promise) => {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const DATA_DIR = path.join(__dirname, "data");
 
 // Load .env from project root (explicit path so it works regardless of cwd)
 const envPath = path.join(__dirname, ".env");
 const envLocalPath = path.join(__dirname, ".env.local");
-const result = dotenv.config({ path: envPath });
-dotenv.config({ path: envLocalPath, override: true });
+const result = dotenv.config({ path: envPath, quiet: true });
+dotenv.config({ path: envLocalPath, override: true, quiet: true });
 
 // Fix BOM: if env key has BOM prefix (e.g. from Windows/editor), copy to correct key
 if (result.parsed) {
@@ -124,6 +126,10 @@ try {
   db.exec(`ALTER TABLE telemetry ADD COLUMN raw_response TEXT`);
 } catch (e) {}
 
+try {
+  db.exec(`ALTER TABLE projects ADD COLUMN s_ocean_score REAL`);
+} catch (e) {}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS failed_extractions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,6 +139,48 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
+
+// --- ETL: Structural Memory (MasterSeeds + DeepLinkCache) ---
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function loadMasterSeeds(): { name: string; url: string }[] {
+  ensureDataDir();
+  const p = path.join(DATA_DIR, "MasterSeeds.json");
+  if (!fs.existsSync(p)) return [];
+  try {
+    const data = JSON.parse(fs.readFileSync(p, "utf-8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+function loadDeepLinkCache(filename: string): { urls: string[] } {
+  ensureDataDir();
+  const p = path.join(DATA_DIR, filename);
+  if (!fs.existsSync(p)) return { urls: [] };
+  try {
+    const data = JSON.parse(fs.readFileSync(p, "utf-8"));
+    return { urls: Array.isArray(data?.urls) ? data.urls : [] };
+  } catch {
+    return { urls: [] };
+  }
+}
+
+function saveDeepLinkCache(filename: string, urls: string[]) {
+  ensureDataDir();
+  const p = path.join(DATA_DIR, filename);
+  const existing = loadDeepLinkCache(filename);
+  const merged = [...new Set([...existing.urls, ...urls])];
+  fs.writeFileSync(p, JSON.stringify({ urls: merged, updated_at: new Date().toISOString() }, null, 2));
+}
+
+function appendToDeepLinkCache(filename: string, newUrls: string[]) {
+  const existing = loadDeepLinkCache(filename);
+  saveDeepLinkCache(filename, [...existing.urls, ...newUrls]);
+}
 
 const GOAL_PROMPT = `
 ### Objective
@@ -152,15 +200,17 @@ Example: ["https://example.com/project1", "https://example.com/project2"]
 
 const EXTRACT_PROMPT = `
 ### Objective
-L'agent doit lire la page du projet et extraire les informations détaillées.
+L'agent doit lire la page du projet et extraire les informations détaillées. Base de données UNIQUEMENT pour projets MARINS/OCÉAN (conservation marine, océans, mers, côtes, espèces marines, récifs coralliens).
 
 ### Instructions
 1. Read the project details on the page.
-2. Extract the following information: title, description, funder, latitude, longitude, category, status, image_url, start_date, end_date.
-3. If some information is missing, use null or a reasonable default (e.g., 0 for lat/lng if not found).
+2. Extract: title, description, funder, latitude, longitude, category, status, image_url, start_date, end_date.
+3. marine_relevance (0-1): 1=clairement marin/océan, 0=pas marin. Si projet terrestre/freshwater/général sans lien océan → 0.
+4. location_type: "coastal" si près de la mer, "inland" si en terres (loin des côtes), "unknown" si incertain.
+5. Si coordonnées suggèrent un lieu INLAND, être TRÈS strict: marine_relevance >= 0.9 uniquement si lien océan explicite.
 
 ### Output Format
-Return ONLY a valid JSON object matching this schema:
+Return ONLY a valid JSON object:
 {
   "title": "string",
   "url": "string",
@@ -172,38 +222,179 @@ Return ONLY a valid JSON object matching this schema:
   "status": "string",
   "image_url": "string",
   "start_date": "string",
-  "end_date": "string"
+  "end_date": "string",
+  "marine_relevance": number,
+  "location_type": "coastal" | "inland" | "unknown"
 }
 `;
 
-const agentQueue: { url: string, proxy?: string, mode?: 'discover' | 'extract' }[] = [];
+type GatekeeperConfig = { marine_threshold?: number; inland_threshold?: number; coast_distance_km?: number };
+type ExtractionConfig = { concurrency?: number; claudeGatekeeperModel?: string; claudeExtractModel?: string };
+type AgentConfig = { maxConcurrentAgents?: number };
+type TaskConfig = { gatekeeper?: GatekeeperConfig; extraction?: ExtractionConfig; agent?: AgentConfig };
+const agentQueue: { url: string; proxy?: string; mode?: "discover" | "extract"; config?: TaskConfig }[] = [];
 let activeAgents = 0;
-const MAX_CONCURRENT_AGENTS = 2;
+let maxConcurrentAgents = 4; // Surchargé par config.agent.maxConcurrentAgents au deploy
 
 // Store active runs for SSE proxying and cancellation
-const activeRuns = new Map<string, { streamingUrl: string, logs: any[], aborted?: boolean, status?: string }>();
+let agentCounter = 0;
+const activeRuns = new Map<string, { streamingUrl: string, logs: any[], aborted?: boolean, status?: string, targetUrl?: string, mode?: string, agentLabel?: string }>();
 
-async function processQueue() {
-  if (activeAgents >= MAX_CONCURRENT_AGENTS || agentQueue.length === 0) {
-    return;
-  }
-  
-  activeAgents++;
-  const task = agentQueue.shift()!;
-  
+// When true, GET /api/agent/active-runs returns [] until next deploy (prevents stale poll data)
+// Start stopped so hard reload / server restart shows clean state (no ghost agents)
+let swarmStopped = true;
+
+// Mesure du temps de processus (deploy → dernière tâche terminée)
+let deployStartTime: number | null = null;
+
+/** Extract-only: Readability + Claude pipeline (no TinyFish). Used for Pages cache URLs. */
+async function runExtractOnly(projectUrl: string, taskConfig?: TaskConfig): Promise<number> {
+  if (swarmStopped) return 0;
   try {
-    await runTinyFishAgent(task.url, task.proxy, 0, task.mode || 'discover');
-  } catch (error) {
-    console.error(`Agent failed for ${task.url}:`, error);
-  } finally {
-    activeAgents--;
-    processQueue();
+    const host = (() => { try { return new URL(projectUrl).hostname; } catch { return projectUrl.slice(0, 30); } })();
+    broadcastLog(`[ETL] Fetch → ${host}`);
+    const { markdown, method } = await fetchMarkdown(projectUrl);
+    const projectData = await extractProjectData(markdown, projectUrl, taskConfig?.extraction);
+    if (swarmStopped) return 0;
+    const gatekeeper = passesMarineGatekeeper(projectData, taskConfig?.gatekeeper);
+    if (!gatekeeper.pass) {
+      broadcastLog(`[ETL] Gatekeeper rejected → ${host}`);
+      console.log(`[Gatekeeper] REJECTED ${projectUrl}: ${gatekeeper.reason}`);
+      return 0;
+    }
+    const relevanceScore = typeof projectData.marine_relevance === "number" ? projectData.marine_relevance : 0.95;
+    broadcastLog(`[ETL] Claude extract → ${(projectData.title || "?").slice(0, 40)}`);
+    const upsertResult = upsertProject({
+      title: projectData.title || "Unknown",
+      url: projectData.url || projectUrl,
+      description: projectData.description || "",
+      funder: projectData.funder || "Unknown",
+      lat: projectData.lat || 0,
+      lng: projectData.lng || 0,
+      category: projectData.category || "Marine Conservation",
+      status: projectData.status || "Active",
+      image_url: projectData.image_url || "",
+      start_date: projectData.start_date || null,
+      end_date: projectData.end_date || null,
+      relevance_score: relevanceScore,
+      s_ocean_score: projectData.s_ocean_score ?? 0.75,
+    });
+    if (upsertResult !== "skipped") {
+      broadcastLog(`[ETL] Saved → ${(projectData.title || "?").slice(0, 35)}`);
+    }
+    return upsertResult !== "skipped" ? 1 : 0;
+  } catch (err: any) {
+    console.error(`[Extract] Error for ${projectUrl}:`, err.message);
+    throw err;
   }
 }
 
+function processQueue() {
+  while (!swarmStopped && activeAgents < maxConcurrentAgents && agentQueue.length > 0) {
+    activeAgents++;
+    const task = agentQueue.shift()!;
+    const mode = task.mode || "discover";
+    const shortUrl = task.url.length > 45 ? task.url.slice(0, 42) + "…" : task.url;
+    if (mode === "extract") {
+      broadcastLog(`[ETL] Extract-only → ${shortUrl}`);
+    }
+    (async () => {
+      try {
+        if (mode === "extract") {
+          await runExtractOnly(task.url, task.config);
+        } else {
+          await runTinyFishAgent(task.url, task.proxy, 0, "discover", task.config);
+        }
+      } catch (error) {
+        console.error(`Agent failed for ${task.url}:`, error);
+      } finally {
+        activeAgents--;
+        processQueue();
+        if (deployStartTime && activeAgents === 0 && agentQueue.length === 0) {
+          const elapsedSec = ((Date.now() - deployStartTime) / 1000).toFixed(1);
+          broadcastLog(`[ETL] Swarm terminé en ${elapsedSec}s`);
+          console.log(`[Swarm] Process completed in ${elapsedSec}s`);
+          deployStartTime = null;
+        }
+      }
+    })();
+  }
+}
+
+// --- Dédoublonnage (Follow the Money: 500m, near-identical description) ---
+const DEDUP_TITLE_SIMILARITY = 0.85;
+const DEDUP_DESC_SIMILARITY = 0.85;
+const DEDUP_COORD_KM = 0.5; // 500m per target pipeline
+
+function normalizeText(s: string): string {
+  return (s || "").toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+function textSimilarity(a: string, b: string, maxLen?: number): number {
+  const na = normalizeText(a);
+  const nb = normalizeText(b);
+  if (!na || !nb) return na === nb ? 1 : 0;
+  let sa = na, sb = nb;
+  if (maxLen) {
+    sa = sa.slice(0, maxLen);
+    sb = sb.slice(0, maxLen);
+  }
+  if (sa === sb) return 1;
+  const wa = new Set(sa.split(/\s+/).filter(Boolean));
+  const wb = new Set(sb.split(/\s+/).filter(Boolean));
+  const inter = [...wa].filter((w) => wb.has(w)).length;
+  const union = wa.size + wb.size - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+function haversineDistanceKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+const selectCandidatesByCoords = db.prepare(`
+  SELECT id, title, url, description, lat, lng FROM projects
+  WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?
+`);
+
+function findDuplicateProject(project: { title: string; description: string; lat: number; lng: number }): { id: number; url: string } | null {
+  const { title, description, lat, lng } = project;
+  const delta = 0.02; // ~2km bounding box
+  const rows = selectCandidatesByCoords.all(
+    lat - delta,
+    lat + delta,
+    lng - delta,
+    lng + delta
+  ) as { id: number; title: string; url: string; description: string; lat: number; lng: number }[];
+  for (const row of rows) {
+    const dist = haversineDistanceKm(lat, lng, row.lat, row.lng);
+    if (dist > DEDUP_COORD_KM) continue;
+    const tSim = textSimilarity(title, row.title);
+    const dSim = textSimilarity(description, row.description, 200);
+    if (tSim >= DEDUP_TITLE_SIMILARITY && dSim >= DEDUP_DESC_SIMILARITY) {
+      return { id: row.id, url: row.url };
+    }
+  }
+  return null;
+}
+
+const updateProjectByIdStmt = db.prepare(`
+  UPDATE projects SET
+    title = ?, description = ?, funder = ?, lat = ?, lng = ?,
+    category = ?, status = ?, image_url = ?, start_date = ?, end_date = ?,
+    relevance_score = ?, s_ocean_score = ?
+  WHERE id = ?
+`);
+
 const insertProjectStmt = db.prepare(`
-  INSERT INTO projects (title, url, description, funder, lat, lng, category, status, relevance_score, image_url, start_date, end_date)
-  VALUES (@title, @url, @description, @funder, @lat, @lng, @category, @status, @relevance_score, @image_url, @start_date, @end_date)
+  INSERT INTO projects (title, url, description, funder, lat, lng, category, status, relevance_score, image_url, start_date, end_date, s_ocean_score)
+  VALUES (@title, @url, @description, @funder, @lat, @lng, @category, @status, @relevance_score, @image_url, @start_date, @end_date, @s_ocean_score)
   ON CONFLICT(url) DO UPDATE SET
     title = excluded.title,
     description = excluded.description,
@@ -215,41 +406,92 @@ const insertProjectStmt = db.prepare(`
     image_url = excluded.image_url,
     start_date = excluded.start_date,
     end_date = excluded.end_date,
-    relevance_score = excluded.relevance_score
+    relevance_score = excluded.relevance_score,
+    s_ocean_score = excluded.s_ocean_score
 `);
+
+type ProjectRow = {
+  title: string;
+  url?: string;
+  description?: string;
+  funder?: string | string[];
+  lat: number;
+  lng: number;
+  category?: string;
+  status?: string;
+  image_url?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  relevance_score?: number;
+  s_ocean_score?: number;
+};
+
+function upsertProject(p: ProjectRow): "inserted" | "updated" | "skipped" {
+  if (swarmStopped) return "skipped"; // Stop all inserts when swarm is stopped
+  if (!p || !p.title || p.lat === undefined || p.lng === undefined) return "skipped";
+  const lat = parseFloat(String(p.lat));
+  const lng = parseFloat(String(p.lng));
+  if (isNaN(lat) || isNaN(lng)) return "skipped";
+
+  const title = p.title;
+  const description = p.description || "";
+  const funder = Array.isArray(p.funder) ? p.funder.join(", ") : (p.funder || "");
+  const projectUrl = p.url || `internal://${title.replace(/[^\w]/g, "-").toLowerCase()}-${lat}-${lng}`;
+
+  const dup = findDuplicateProject({ title, description, lat, lng });
+  if (dup) {
+    const existing = db.prepare("SELECT funder FROM projects WHERE id = ?").get(dup.id) as { funder: string } | undefined;
+    const mergedFunder = existing?.funder
+      ? [...new Set([...existing.funder.split(",").map((f) => f.trim()).filter(Boolean), ...funder.split(",").map((f) => f.trim()).filter(Boolean)])].join(", ")
+      : funder;
+    updateProjectByIdStmt.run(
+      title,
+      description,
+      mergedFunder,
+      lat,
+      lng,
+      p.category || "General",
+      p.status || "Active",
+      p.image_url ?? null,
+      p.start_date ?? null,
+      p.end_date ?? null,
+      p.relevance_score ?? 0.95,
+      p.s_ocean_score ?? 0.75,
+      dup.id
+    );
+    return "updated";
+  }
+
+  insertProjectStmt.run({
+    title,
+    url: projectUrl,
+    description,
+    funder,
+    lat,
+    lng,
+    category: p.category || "General",
+    status: p.status || "Active",
+    image_url: p.image_url ?? null,
+    start_date: p.start_date ?? null,
+    end_date: p.end_date ?? null,
+    relevance_score: p.relevance_score ?? 0.95,
+    s_ocean_score: p.s_ocean_score ?? 0.75,
+  });
+  const row = db.prepare("SELECT id FROM projects WHERE url = ?").get(projectUrl) as { id: number } | undefined;
+  const feature = {
+    type: "Feature",
+    geometry: { type: "Point", coordinates: [lng, lat] },
+    properties: { id: row?.id, title, url: projectUrl, description, funder, relevance_score: p.relevance_score ?? 0.95, s_ocean_score: p.s_ocean_score ?? 0.75, category: p.category, status: p.status, image_url: p.image_url, start_date: p.start_date, end_date: p.end_date }
+  };
+  broadcastNewProject(feature);
+  return "inserted";
+}
 
 const insertManyProjects = db.transaction((projects: any[]) => {
   let count = 0;
   for (const p of projects) {
-    if (p && p.title && p.lat !== undefined && p.lng !== undefined) {
-      const lat = parseFloat(p.lat);
-      const lng = parseFloat(p.lng);
-      
-      if (!isNaN(lat) && !isNaN(lng)) {
-        try {
-          // If URL is missing, we use a placeholder to avoid skipping
-          const projectUrl = p.url || `internal://${p.title.replace(/[^\w]/g, '-').toLowerCase()}-${lat}-${lng}`;
-          
-          insertProjectStmt.run({
-            title: p.title,
-            url: projectUrl,
-            description: p.description || "",
-            funder: Array.isArray(p.funder) ? p.funder.join(", ") : (p.funder || ""),
-            lat: lat,
-            lng: lng,
-            category: p.category || "General",
-            status: p.status || "Active",
-            image_url: p.image_url || null,
-            start_date: p.start_date || null,
-            end_date: p.end_date || null,
-            relevance_score: p.relevance_score || 0.95
-          });
-          count++;
-        } catch (e) {
-          console.error(`[Database] Failed to insert project ${p.title}:`, e);
-        }
-      }
-    }
+    const result = upsertProject(p);
+    if (result !== "skipped") count++;
   }
   return count;
 });
@@ -458,53 +700,178 @@ async function fetchMarkdown(url: string): Promise<{ markdown: string, method: s
   }
 }
 
-async function extractProjectData(markdown: string, url: string) {
+const DEFAULT_GATEKEEPER = {
+  marine_threshold: 0.75,
+  inland_threshold: 0.9,
+  coast_distance_km: 0, // 0 = comportement original (GSHHG point-in-polygon). >0 = tolérer projets à X km de la côte
+};
+
+/** Gatekeeper: reject projects not genuinely related to marine/ocean conservation. Stricter when inland or far from coast. */
+function passesMarineGatekeeper(
+  projectData: any,
+  config?: { marine_threshold?: number; inland_threshold?: number; coast_distance_km?: number }
+): { pass: boolean; reason?: string } {
+  const marineRelevance = typeof projectData.marine_relevance === "number" ? projectData.marine_relevance : 0;
+  const lat = parseFloat(projectData.lat) || 0;
+  const lng = parseFloat(projectData.lng) || 0;
+  const locationType = projectData.location_type || "unknown";
+  const cfg = { ...DEFAULT_GATEKEEPER, ...config };
+  const marineThreshold = cfg.marine_threshold ?? DEFAULT_GATEKEEPER.marine_threshold;
+  const inlandThreshold = cfg.inland_threshold ?? DEFAULT_GATEKEEPER.inland_threshold;
+  const coastKm = cfg.coast_distance_km ?? 0;
+
+  let inland: boolean;
+  if (coastKm > 0) {
+    const dist = distanceToCoastKm(lat, lng);
+    inland = dist > coastKm;
+  } else {
+    const coordsInland = isInlandGSHHG(lat, lng);
+    inland = coordsInland || locationType === "inland";
+  }
+
+  const threshold = inland ? inlandThreshold : marineThreshold;
+  if (marineRelevance < threshold) {
+    return {
+      pass: false,
+      reason: inland
+        ? (coastKm > 0
+            ? `Gatekeeper: projet à >${coastKm} km de la côte (${lat.toFixed(2)}, ${lng.toFixed(2)}), marine_relevance=${marineRelevance.toFixed(2)} < ${threshold}`
+            : `Gatekeeper: projet situé en terres (${lat.toFixed(2)}, ${lng.toFixed(2)}), marine_relevance=${marineRelevance.toFixed(2)} < ${threshold}`)
+        : `Gatekeeper: marine_relevance=${marineRelevance.toFixed(2)} < ${threshold}`,
+    };
+  }
+  return { pass: true };
+}
+
+/** Stage 1: Claude Haiku - Quick gatekeeper filter */
+async function gatekeeperOnly(markdown: string, url: string, modelOverride?: string): Promise<{ pass: boolean; marine_relevance: number; location_type: string }> {
   const apiKey = process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error("CLAUDE_API_KEY (or ANTHROPIC_API_KEY) is not configured");
-
   const client = new Anthropic({ apiKey });
-  try {
-    const response = await client.messages.create({
-      model: "claude-haiku-4-5",
-      max_tokens: 1024,
-      temperature: 0,
-      messages: [
-        {
-          role: "user",
-          content: `Extract the marine conservation project details from the following markdown content. The project URL is ${url}.\n\nMarkdown Content:\n${markdown}`
-        }
-      ],
-      output_config: {
-        format: {
-          type: "json_schema",
-          schema: {
-            type: "object",
-            properties: {
-              title: { type: "string" },
-              url: { type: "string" },
-              description: { type: "string" },
-              funder: { type: "string" },
-              lat: { type: "number" },
-              lng: { type: "number" },
-              category: { type: "string" },
-              status: { type: "string" },
-              image_url: { type: "string" },
-              start_date: { type: "string" },
-              end_date: { type: "string" }
-            },
-            required: ["title", "url", "description", "funder", "lat", "lng", "category", "status", "image_url"],
-            additionalProperties: false
-          }
+  const model = modelOverride || CLAUDE_GATEKEEPER_MODEL;
+  const excerpt = markdown.slice(0, 4000);
+  const response = await client.messages.create({
+    model,
+    max_tokens: 128,
+    temperature: 0,
+    messages: [{
+      role: "user",
+      content: `URL: ${url}\n\nIs this page about OCEAN/MARINE conservation? Return ONLY valid JSON: { "marine_relevance": 0-1, "location_type": "coastal"|"inland"|"unknown" }. 0=not marine, 1=clearly marine. No markdown, no explanation.\n\nExcerpt:\n${excerpt}`
+    }],
+  });
+  const textBlock = (response.content as any[]).find((b: any) => b.type === "text");
+  const raw = (textBlock?.text || "{}").trim();
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  const data = JSON.parse(jsonMatch ? jsonMatch[0] : "{}");
+  const mr = typeof data.marine_relevance === "number" ? data.marine_relevance : 0.5;
+  const lt = data.location_type || "unknown";
+  const gk = passesMarineGatekeeper({ marine_relevance: mr, location_type: lt, lat: 0, lng: 0 });
+  return { pass: gk.pass, marine_relevance: mr, location_type: lt };
+}
+
+const CLAUDE_EXTRACT_MODEL = process.env.CLAUDE_EXTRACT_MODEL || "claude-sonnet-4-5-20250929";
+const CLAUDE_GATEKEEPER_MODEL = process.env.CLAUDE_GATEKEEPER_MODEL || "claude-haiku-4-5-20251001";
+const EXTRACT_CONCURRENCY = Math.max(1, Math.min(20, parseInt(process.env.EXTRACT_CONCURRENCY || "8", 10)));
+
+/** Run async tasks with limited concurrency (worker pool). */
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<number>,
+  shouldAbort?: () => boolean
+): Promise<number> {
+  if (items.length === 0) return 0;
+  let nextIndex = 0;
+  const results: number[] = new Array(items.length);
+  const workers = Array(Math.min(concurrency, items.length))
+    .fill(null)
+    .map(async () => {
+      while (true) {
+        if (shouldAbort?.()) return;
+        const i = nextIndex++;
+        if (i >= items.length) return;
+        try {
+          results[i] = await fn(items[i], i);
+        } catch {
+          results[i] = 0;
         }
       }
     });
+  await Promise.all(workers);
+  return results.reduce((a, b) => a + (b || 0), 0);
+}
 
-    const textBlock = response.content.find((block): block is { type: "text"; text: string } => block.type === "text");
-    if (!textBlock?.text) throw new Error("Empty response from Claude");
-    return JSON.parse(textBlock.text);
-  } catch (err: any) {
-    throw new Error(`Claude API Error: ${err.message}`);
+/** Stage 2: Claude Sonnet - Analysis, geocoding, coastal snapping. Description < 250 chars */
+async function extractAndGeocode(markdown: string, url: string, modelOverride?: string): Promise<any> {
+  const apiKey = process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error("CLAUDE_API_KEY (or ANTHROPIC_API_KEY) is not configured");
+  const client = new Anthropic({ apiKey });
+  const model = modelOverride || CLAUDE_EXTRACT_MODEL;
+  const response = await client.messages.create({
+    model,
+    max_tokens: 1024,
+    temperature: 0,
+    messages: [{
+      role: "user",
+      content: `Extract marine conservation project from this page. URL: ${url}
+
+RULES:
+- description: answer why, what, how, when, where in < 250 characters.
+- If coordinates (lat,lng) are INLAND (Paris, Geneva, US Midwest), apply COASTAL SNAPPING: recalculate to nearest maritime/coastal point.
+- marine_relevance 0-1, location_type coastal|inland|unknown
+- image_url: extract ANY project-related image. Prefer: og:image meta, first img/figure in content, hero/banner images, logos, diagrams. Use absolute URLs. If the page links to PDFs with images, use the PDF URL or an image URL from the same domain. Empty string only if no image found.
+
+Return ONLY valid JSON (no markdown, no explanation):
+{"title":"string","url":"string","description":"string","funder":"string","lat":number,"lng":number,"category":"string","status":"string","image_url":"string","start_date":"string","end_date":"string","marine_relevance":number,"location_type":"coastal|inland|unknown"}
+
+Markdown:
+${markdown.slice(0, 12000)}`
+    }],
+  });
+  const textBlock = (response.content as any[]).find((b: any) => b.type === "text");
+  const raw = (textBlock?.text || "{}").trim();
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  const data = JSON.parse(jsonMatch ? jsonMatch[0] : "{}");
+  if (data.marine_relevance === undefined) data.marine_relevance = 0.95;
+  if (data.location_type === undefined) data.location_type = "unknown";
+  return data;
+}
+
+/** Stage 3: Claude Sonnet - S_ocean scoring */
+async function scoreSOcean(projectData: any, modelOverride?: string): Promise<number> {
+  const apiKey = process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error("CLAUDE_API_KEY (or ANTHROPIC_API_KEY) is not configured");
+  const client = new Anthropic({ apiKey });
+  const model = modelOverride || CLAUDE_EXTRACT_MODEL;
+  const response = await client.messages.create({
+    model,
+    max_tokens: 64,
+    temperature: 0,
+    messages: [{
+      role: "user",
+      content: `Score this marine project 0-1 (S_ocean): technicality, source reliability, oceanic localization. Return ONLY valid JSON: { "s_ocean_score": number }. No markdown, no explanation.\n\nProject: ${projectData.title}\n${projectData.description?.slice(0, 200) || ""}\nURL: ${projectData.url || ""}\nCoords: ${projectData.lat}, ${projectData.lng}`
+    }],
+  });
+  const textBlock = (response.content as any[]).find((b: any) => b.type === "text");
+  const raw = (textBlock?.text || "{}").trim();
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  const data = JSON.parse(jsonMatch ? jsonMatch[0] : "{}");
+  return typeof data.s_ocean_score === "number" ? Math.max(0, Math.min(1, data.s_ocean_score)) : 0.75;
+}
+
+/** Full 3-stage pipeline: Haiku gatekeeper → Sonnet extract+coastal snapping → Sonnet S_ocean */
+async function extractProjectData(markdown: string, url: string, extractionConfig?: ExtractionConfig) {
+  const gatekeeperModel = extractionConfig?.claudeGatekeeperModel || CLAUDE_GATEKEEPER_MODEL;
+  const extractModel = extractionConfig?.claudeExtractModel || CLAUDE_EXTRACT_MODEL;
+  const gatekeeper = await gatekeeperOnly(markdown, url, gatekeeperModel);
+  if (!gatekeeper.pass) {
+    throw new Error(`Gatekeeper rejected: marine_relevance=${gatekeeper.marine_relevance}`);
   }
+  const projectData = await extractAndGeocode(markdown, url, extractModel);
+  projectData.marine_relevance = gatekeeper.marine_relevance;
+  projectData.location_type = gatekeeper.location_type;
+  projectData.s_ocean_score = await scoreSOcean(projectData, extractModel);
+  return projectData;
 }
 
 function parseUrlsData(projectsData: any): string[] {
@@ -557,7 +924,8 @@ function parseUrlsData(projectsData: any): string[] {
   return projects.filter(p => typeof p === 'string');
 }
 
-async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 0, mode: 'discover' | 'extract' = 'discover') {
+async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 0, mode: 'discover' | 'extract' = 'discover', taskConfig?: TaskConfig) {
+  if (swarmStopped) return 0;
   const startTime = performance.now();
   console.log(`[TinyFish] Starting agent for: ${targetUrl} (Attempt ${retryCount + 1}, Mode: ${mode})`);
   let runId = "";
@@ -603,7 +971,13 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
     console.log(`[TinyFish] Run started: ${runId} for ${targetUrl}. Status: ${runData.status || 'UNKNOWN'}`);
     if (runData.error) console.log(`[TinyFish] Note: Run started with non-fatal error key: ${runData.error}`);
     
-    activeRuns.set(runId, { streamingUrl, logs: [], status: runData.status || "PENDING" });
+    if (swarmStopped) return 0; // Don't increment or register if we stopped
+    agentCounter++;
+    const label = `TinyFish ${agentCounter}`;
+    activeRuns.set(runId, { streamingUrl, logs: [], status: runData.status || "PENDING", targetUrl, mode, agentLabel: label });
+    const shortUrl = targetUrl.length > 50 ? targetUrl.slice(0, 47) + "…" : targetUrl;
+    broadcastLog(`[Swarm] ${label} dispatched → ${shortUrl}`);
+    broadcastLog(`[${label}] ${mode === "extract" ? "Extract" : "Discovery"} browsing → ${shortUrl}`);
 
     // 3. Poll for completion (or we could use SSE, but for the backend poll is safer for DB update)
     let status = runData.status || "PENDING";
@@ -656,6 +1030,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
         }
         
         if (status === "COMPLETED") {
+          broadcastLog(`[${label}] ${mode === "extract" ? "Extract" : "Discovery"} complete`);
           const safeStatusData = { ...statusData };
           if (safeStatusData.error === null) delete safeStatusData.error;
           if (safeStatusData.steps) delete safeStatusData.steps;
@@ -664,6 +1039,8 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
           if (safeStatusData.output) delete safeStatusData.output;
           console.log(`[TinyFish] Run ${runId} COMPLETED. Data:`, JSON.stringify(safeStatusData));
           result = statusData.result || statusData.output;
+          // Retirer immédiatement de l'UI : les anciens agents ne s'affichent plus
+          activeRuns.delete(runId);
         } else if (status === "FAILED") {
           const safeStatusData = { ...statusData };
           if (safeStatusData.steps) delete safeStatusData.steps;
@@ -689,6 +1066,7 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
       console.log(`[TinyFish] Received result for ${targetUrl}`);
       
       if (mode === 'extract') {
+        if (swarmStopped) return 0;
         try {
           // Parse the JSON result directly
           let projectData = result;
@@ -697,42 +1075,51 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
             const cleaned = jsonMatch ? jsonMatch[1] : result.trim();
             projectData = JSON.parse(cleaned);
           }
-          
-          const stmt = db.prepare(`
-            INSERT INTO projects (title, url, description, funder, lat, lng, category, status, image_url, start_date, end_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(url) DO UPDATE SET
-              title = excluded.title,
-              description = excluded.description,
-              funder = excluded.funder,
-              lat = excluded.lat,
-              lng = excluded.lng,
-              category = excluded.category,
-              status = excluded.status,
-              image_url = excluded.image_url,
-              start_date = excluded.start_date,
-              end_date = excluded.end_date
-          `);
-          
-          stmt.run(
-            projectData.title || 'Unknown',
-            projectData.url || targetUrl,
-            projectData.description || '',
-            projectData.funder || 'Unknown',
-            projectData.lat || 0,
-            projectData.lng || 0,
-            projectData.category || 'Marine Conservation',
-            projectData.status || 'Active',
-            projectData.image_url || '',
-            projectData.start_date || null,
-            projectData.end_date || null
-          );
+          if (projectData.marine_relevance === undefined) projectData.marine_relevance = 0.5;
+          if (projectData.location_type === undefined) projectData.location_type = "unknown";
+
+          if (swarmStopped) return 0;
+          const gatekeeper = passesMarineGatekeeper(projectData, taskConfig?.gatekeeper);
+          if (!gatekeeper.pass) {
+            console.log(`[Gatekeeper] REJECTED (extract mode) ${targetUrl}: ${gatekeeper.reason}`);
+            try {
+              db.prepare(`
+                INSERT INTO failed_extractions (target_url, project_url, error_message)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_url) DO UPDATE SET
+                  error_message = excluded.error_message,
+                  created_at = CURRENT_TIMESTAMP
+              `).run(targetUrl, targetUrl, gatekeeper.reason!);
+            } catch (dbErr) {}
+            throw new Error(gatekeeper.reason);
+          }
+
+          const relevanceScore = typeof projectData.marine_relevance === "number" ? projectData.marine_relevance : 0.95;
+          const upsertResult = upsertProject({
+            title: projectData.title || 'Unknown',
+            url: projectData.url || targetUrl,
+            description: projectData.description || '',
+            funder: projectData.funder || 'Unknown',
+            lat: projectData.lat || 0,
+            lng: projectData.lng || 0,
+            category: projectData.category || 'Marine Conservation',
+            status: projectData.status || 'Active',
+            image_url: projectData.image_url || '',
+            start_date: projectData.start_date || null,
+            end_date: projectData.end_date || null,
+            relevance_score: relevanceScore,
+            s_ocean_score: projectData.s_ocean_score ?? 0.75,
+          });
           
           try {
             db.prepare(`DELETE FROM failed_extractions WHERE project_url = ?`).run(targetUrl);
           } catch (e) {}
           
-          projectsFound = 1;
+          projectsFound = upsertResult !== "skipped" ? 1 : 0;
+          if (upsertResult !== "skipped") {
+            broadcastLog(`[ETL] Saved → ${(projectData.title || "?").slice(0, 35)}`);
+          }
+          broadcastLog(`[ETL] Extract complete: ${projectsFound} project saved`);
           console.log(`[TinyFish] Extraction mode finished successfully for ${targetUrl}`);
         } catch (err: any) {
           console.error(`[TinyFish] Error parsing extraction result for ${targetUrl}:`, err.message);
@@ -740,53 +1127,71 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
         }
       } else {
         const urls = parseUrlsData(result);
-        console.log(`[TinyFish] Discovered ${urls.length} URLs for ${targetUrl}. Starting hybrid extraction...`);
+        const currentRunAfterDiscover = activeRuns.get(runId);
+        if (swarmStopped || currentRunAfterDiscover?.aborted) {
+          console.log(`[TinyFish] Run ${runId} stopped before extraction. Skipping hybrid extraction.`);
+          activeRuns.delete(runId);
+          return;
+        }
+        const extractConcurrency = taskConfig?.extraction?.concurrency ?? EXTRACT_CONCURRENCY;
+        broadcastLog(`[ETL] DeepLinkCache updated (+${urls.length} pages)`);
+        broadcastLog(`[ETL] Extraction pipeline: ${urls.length} URLs (concurrency=${extractConcurrency})`);
+        console.log(`[TinyFish] Discovered ${urls.length} URLs for ${targetUrl}. Starting hybrid extraction (concurrency=${extractConcurrency})...`);
+        // ETL: Inject into structural memory
+        appendToDeepLinkCache("DeepLinkCacheProjectsLists.json", [targetUrl]);
+        if (urls.length > 0) appendToDeepLinkCache("DeepLinkCacheProjectsPages.json", urls);
         
-        let successCount = 0;
-        for (let i = 0; i < urls.length; i++) {
-          const projectUrl = urls[i];
+        const successCount = await runWithConcurrency(urls, extractConcurrency, async (projectUrl, i) => {
+          if (swarmStopped || activeRuns.get(runId)?.aborted) return 0;
           try {
+            const host = (() => { try { return new URL(projectUrl).hostname; } catch { return projectUrl.slice(0, 30); } })();
+            broadcastLog(`[ETL] Fetch ${i + 1}/${urls.length}: ${host}`);
             const { markdown, method } = await fetchMarkdown(projectUrl);
-            const projectData = await extractProjectData(markdown, projectUrl);
+            const projectData = await extractProjectData(markdown, projectUrl, taskConfig?.extraction);
+
+            const gatekeeper = passesMarineGatekeeper(projectData, taskConfig?.gatekeeper);
+            if (!gatekeeper.pass) {
+              console.log(`[Gatekeeper] REJECTED ${projectUrl}: ${gatekeeper.reason}`);
+              try {
+                db.prepare(`
+                  INSERT INTO failed_extractions (target_url, project_url, error_message)
+                  VALUES (?, ?, ?)
+                  ON CONFLICT(project_url) DO UPDATE SET
+                    error_message = excluded.error_message,
+                    created_at = CURRENT_TIMESTAMP
+                `).run(targetUrl, projectUrl, gatekeeper.reason!);
+              } catch (dbErr) {}
+              return 0;
+            }
+
+            if (swarmStopped) return 0;
+            const relevanceScore = typeof projectData.marine_relevance === "number" ? projectData.marine_relevance : 0.95;
+            broadcastLog(`[ETL] Claude extract → ${(projectData.title || "?").slice(0, 40)}`);
+            const upsertResult = upsertProject({
+              title: projectData.title || 'Unknown',
+              url: projectData.url || projectUrl,
+              description: projectData.description || '',
+              funder: projectData.funder || 'Unknown',
+              lat: projectData.lat || 0,
+              lng: projectData.lng || 0,
+              category: projectData.category || 'Marine Conservation',
+              status: projectData.status || 'Active',
+              image_url: projectData.image_url || '',
+              start_date: projectData.start_date || null,
+              end_date: projectData.end_date || null,
+              relevance_score: relevanceScore,
+              s_ocean_score: projectData.s_ocean_score ?? 0.75,
+            });
             
-            // Insert into DB
-            const stmt = db.prepare(`
-              INSERT INTO projects (title, url, description, funder, lat, lng, category, status, image_url, start_date, end_date)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              ON CONFLICT(url) DO UPDATE SET
-                title = excluded.title,
-                description = excluded.description,
-                funder = excluded.funder,
-                lat = excluded.lat,
-                lng = excluded.lng,
-                category = excluded.category,
-                status = excluded.status,
-                image_url = excluded.image_url,
-                start_date = excluded.start_date,
-                end_date = excluded.end_date
-            `);
-            
-            stmt.run(
-              projectData.title || 'Unknown',
-              projectData.url || projectUrl,
-              projectData.description || '',
-              projectData.funder || 'Unknown',
-              projectData.lat || 0,
-              projectData.lng || 0,
-              projectData.category || 'Marine Conservation',
-              projectData.status || 'Active',
-              projectData.image_url || '',
-              projectData.start_date || null,
-              projectData.end_date || null
-            );
-            
-            // Remove from failed_extractions if it was there
             try {
               db.prepare(`DELETE FROM failed_extractions WHERE project_url = ?`).run(projectUrl);
             } catch (e) {}
             
-            console.log(`[Extraction] ${i+1}/${urls.length} URL traitée via (${method}): ${projectUrl}`);
-            successCount++;
+            if (upsertResult !== "skipped") {
+              broadcastLog(`[ETL] Saved → ${(projectData.title || "?").slice(0, 35)}`);
+            }
+            console.log(`[Extraction] ${i+1}/${urls.length} URL traitée via (${method}) [marine=${relevanceScore.toFixed(2)}]${upsertResult === "updated" ? " [dédoublonné]" : ""}: ${projectUrl}`);
+            return upsertResult !== "skipped" ? 1 : 0;
           } catch (err: any) {
             console.error(`[Extraction] Error processing ${projectUrl}:`, err.message);
             try {
@@ -797,20 +1202,25 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
                   error_message = excluded.error_message,
                   created_at = CURRENT_TIMESTAMP
               `).run(targetUrl, projectUrl, err.message);
-            } catch (dbErr) {
-              console.error("Failed to save error to DB:", dbErr);
-            }
+            } catch (dbErr) {}
+            return 0;
           }
-        }
+        }, () => swarmStopped || activeRuns.get(runId)?.aborted === true);
         
+        if (activeRuns.get(runId)?.aborted) {
+          console.log(`[TinyFish] Run ${runId} aborted during extraction.`);
+          activeRuns.delete(runId);
+          return;
+        }
         projectsFound = successCount;
+        broadcastLog(`[ETL] Extraction complete: ${projectsFound} projects saved`);
         console.log(`[TinyFish] Hybrid extraction finished. Saved ${projectsFound} projects for ${targetUrl}`);
       }
     }
     
     const duration = Math.round(performance.now() - startTime);
     recordTelemetry('tinyfish', targetUrl, 'SUCCESS', projectsFound, duration, null, rawResponse);
-    activeRuns.delete(runId);
+    activeRuns.delete(runId); // Redondant si COMPLETED, mais sécurise les autres chemins
   } catch (error: any) {
     console.error(`[TinyFish] Error for ${targetUrl}:`, error.message);
     const duration = Math.round(performance.now() - startTime);
@@ -819,12 +1229,39 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
     if (retryCount < 1 && !error.message.includes("aborted")) {
       console.log(`[TinyFish] Retrying ${targetUrl} due to error...`);
       if (runId) activeRuns.delete(runId);
-      return runTinyFishAgent(targetUrl, proxy, retryCount + 1, mode);
+      return runTinyFishAgent(targetUrl, proxy, retryCount + 1, mode, taskConfig);
     }
     
     recordTelemetry('tinyfish', targetUrl, 'ERROR', 0, duration, error.message);
     if (runId) activeRuns.delete(runId);
     throw error;
+  }
+}
+
+// Log stream for frontend (informative process logs)
+const logStreamSubscribers: { res: express.Response }[] = [];
+function broadcastLog(msg: string) {
+  const line = JSON.stringify({ message: msg }) + "\n";
+  for (let i = logStreamSubscribers.length - 1; i >= 0; i--) {
+    try {
+      logStreamSubscribers[i].res.write(`data: ${line}`);
+    } catch (_) {
+      logStreamSubscribers.splice(i, 1);
+    }
+  }
+}
+
+// NDJSON live feed: subscribers receive new projects as they're inserted
+const projectStreamSubscribers: { res: express.Response }[] = [];
+function broadcastNewProject(feature: object) {
+  if (swarmStopped) return;
+  const line = JSON.stringify(feature) + "\n";
+  for (let i = projectStreamSubscribers.length - 1; i >= 0; i--) {
+    try {
+      projectStreamSubscribers[i].res.write(`data: ${line}`);
+    } catch (_) {
+      projectStreamSubscribers.splice(i, 1);
+    }
   }
 }
 
@@ -834,13 +1271,15 @@ async function startServer() {
 
   app.use(express.json());
 
-  // Request logging (API routes only)
+  const DEBUG_API = process.env.DEBUG_API === "1" || process.env.DEBUG_API === "true";
   app.use((req, res, next) => {
-    if (req.path.startsWith("/api/")) {
+    if (DEBUG_API && req.path.startsWith("/api/")) {
       const start = Date.now();
       res.on("finish", () => {
         const duration = Date.now() - start;
-        console.log(`[API] ${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
+        if (res.statusCode >= 400 || duration > 500) {
+          console.log(`[API] ${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
+        }
       });
     }
     next();
@@ -884,6 +1323,7 @@ async function startServer() {
             description: p.description,
             funder: p.funder,
             relevance_score: p.relevance_score,
+            s_ocean_score: p.s_ocean_score,
             category: p.category,
             status: p.status,
             image_url: p.image_url,
@@ -900,9 +1340,51 @@ async function startServer() {
     }
   });
 
+  app.get("/api/projects/stream", (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    projectStreamSubscribers.push({ res });
+    req.on("close", () => {
+      const idx = projectStreamSubscribers.findIndex((s) => s.res === res);
+      if (idx >= 0) projectStreamSubscribers.splice(idx, 1);
+    });
+  });
+
+  app.get("/api/logs/stream", (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    logStreamSubscribers.push({ res });
+    req.on("close", () => {
+      const idx = logStreamSubscribers.findIndex((s) => s.res === res);
+      if (idx >= 0) logStreamSubscribers.splice(idx, 1);
+    });
+  });
+
+  app.get("/api/projects/ndjson", (req, res) => {
+    res.setHeader("Content-Type", "application/x-ndjson");
+    const projects = db.prepare("SELECT * FROM projects").all() as any[];
+    for (const p of projects) {
+      res.write(JSON.stringify({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [p.lng, p.lat] },
+        properties: { id: p.id, title: p.title, url: p.url, description: p.description, funder: p.funder, relevance_score: p.relevance_score, s_ocean_score: p.s_ocean_score, category: p.category, status: p.status, image_url: p.image_url, start_date: p.start_date, end_date: p.end_date }
+      }) + "\n");
+    }
+    res.end();
+  });
+
   app.post("/api/projects/clear", (req, res) => {
     try {
+      swarmStopped = true;
+      deployStartTime = null;
+      agentQueue.length = 0;
+      activeAgents = 0;
+      agentCounter = 0;
+      activeRuns.clear(); // Remove all runs so agent numbering resets on next deploy
       db.prepare("DELETE FROM projects").run();
+      broadcastLog("[ETL] Database cleared");
       res.json({ status: "ok", message: "All projects cleared" });
     } catch (error) {
       console.error("Error clearing projects:", error);
@@ -930,11 +1412,24 @@ async function startServer() {
     }
   });
 
+  app.get("/api/config/defaults", (_req, res) => {
+    res.json({
+      gatekeeper: {
+        marine_threshold: DEFAULT_GATEKEEPER.marine_threshold,
+        inland_threshold: DEFAULT_GATEKEEPER.inland_threshold,
+        coast_distance_km: DEFAULT_GATEKEEPER.coast_distance_km,
+      },
+    });
+  });
+
   app.post("/api/agent/force-extract", async (req, res) => {
-    const { projectUrls, proxy } = req.body;
+    const { projectUrls, proxy, config } = req.body;
     
     if (!projectUrls || !Array.isArray(projectUrls) || projectUrls.length === 0) {
       return res.status(400).json({ error: "projectUrls array is required" });
+    }
+    if (swarmStopped) {
+      return res.status(409).json({ error: "Swarm is stopped. Deploy first to queue force-extract." });
     }
 
     const tinyfishKey = process.env.TINYFISH_API_KEY;
@@ -942,10 +1437,10 @@ async function startServer() {
       return res.status(500).json({ error: "TINYFISH_API_KEY is not configured" });
     }
 
-    // Add to queue and process in background
+    const taskConfig = config as TaskConfig | undefined;
     for (const url of projectUrls) {
       if (!agentQueue.find(t => t.url === url)) {
-        agentQueue.push({ url, proxy, mode: 'extract' });
+        agentQueue.push({ url, proxy, mode: 'extract', config: taskConfig });
       }
     }
     processQueue();
@@ -953,11 +1448,95 @@ async function startServer() {
     res.json({ status: "QUEUED", message: `${projectUrls.length} agents deployed in background for forced extraction` });
   });
 
+  app.get("/api/etl/seeds", (req, res) => {
+    try {
+      const seeds = loadMasterSeeds();
+      res.json(seeds);
+    } catch (e) {
+      res.status(500).json({ error: "Failed to load MasterSeeds" });
+    }
+  });
+
+  app.get("/api/etl/caches", (req, res) => {
+    try {
+      const lists = loadDeepLinkCache("DeepLinkCacheProjectsLists.json");
+      const pages = loadDeepLinkCache("DeepLinkCacheProjectsPages.json");
+      res.json({ lists: lists.urls, pages: pages.urls });
+    } catch (e) {
+      res.status(500).json({ error: "Failed to load caches" });
+    }
+  });
+
+  app.post("/api/etl/swarm-deploy", async (req, res) => {
+    const { clearBeforeStart, testMode, proxy, config } = req.body || {};
+    const tinyfishKey = process.env.TINYFISH_API_KEY;
+    if (!tinyfishKey) {
+      return res.status(500).json({ error: "TINYFISH_API_KEY is not configured" });
+    }
+    swarmStopped = false;
+    deployStartTime = Date.now();
+    maxConcurrentAgents = Math.max(1, Math.min(2, config?.agent?.maxConcurrentAgents ?? 2));
+    broadcastLog("[ETL] Swarm deploy starting...");
+    agentQueue.length = 0;
+    activeAgents = 0; // Reset so processQueue can start new tasks immediately
+    agentCounter = 0; // Fresh start: agent numbering begins at 1
+    activeRuns.clear();
+    if (clearBeforeStart) {
+      db.prepare("DELETE FROM projects").run();
+      broadcastLog("[ETL] Database cleared");
+    }
+    const seeds = loadMasterSeeds();
+    const lists = loadDeepLinkCache("DeepLinkCacheProjectsLists.json");
+    const pages = loadDeepLinkCache("DeepLinkCacheProjectsPages.json");
+    broadcastLog(`[ETL] MasterSeeds: ${seeds.length} foundations`);
+    broadcastLog(`[ETL] DeepLinkCache: ${lists.urls.length} lists, ${pages.urls.length} pages`);
+    const existingUrls = new Set(
+      (db.prepare("SELECT url FROM projects WHERE url IS NOT NULL").all() as { url: string }[]).map(r => r.url)
+    );
+    const discoverUrlsFull = [...new Set([
+      ...seeds.map((s: { url: string }) => s.url),
+      ...lists.urls
+    ])];
+    const discoverUrls = testMode
+      ? seeds.slice(0, Math.max(2, maxConcurrentAgents)).map((s: { url: string }) => s.url)
+      : discoverUrlsFull;
+    const extractUrls = pages.urls.filter((u: string) => !existingUrls.has(u));
+    const taskConfig = config as TaskConfig | undefined;
+    const toEnqueue: { url: string; proxy?: string; mode: "discover" | "extract"; config?: TaskConfig }[] = [];
+    const discoverLimit = testMode ? Math.max(2, maxConcurrentAgents) : discoverUrls.length;
+    const extractLimit = testMode ? 0 : extractUrls.length;
+    for (let i = 0; i < Math.min(discoverUrls.length, discoverLimit); i++) {
+      toEnqueue.push({ url: discoverUrls[i], proxy, mode: "discover", config: taskConfig });
+    }
+    for (let i = 0; i < Math.min(extractUrls.length, extractLimit); i++) {
+      toEnqueue.push({ url: extractUrls[i], proxy, mode: "extract", config: taskConfig });
+    }
+    const nDiscover = toEnqueue.filter(t => t.mode === "discover").length;
+    const nExtract = toEnqueue.filter(t => t.mode === "extract").length;
+    broadcastLog(`[ETL] Queue: ${nDiscover} discover + ${nExtract} extract = ${toEnqueue.length} tasks`);
+    for (const t of toEnqueue) {
+      agentQueue.push(t);
+    }
+    broadcastLog(`[ETL] ${toEnqueue.length} tasks enqueued → Swarm`);
+    console.log(`[Swarm] Deploy: ${toEnqueue.length} tasks enqueued (${nDiscover} discover, ${nExtract} extract)`);
+    processQueue();
+    res.json({
+      status: "QUEUED",
+      message: `ETL Swarm deployed. ${toEnqueue.length} tasks enqueued (${discoverUrls.length} discover, ${extractUrls.length} extract available).`,
+      enqueued: toEnqueue.length,
+      discoverAvailable: discoverUrls.length,
+      extractAvailable: extractUrls.length
+    });
+  });
+
   app.post("/api/agent/start", async (req, res) => {
-    const { targetUrl, proxy } = req.body;
+    const { targetUrl, proxy, mode, config } = req.body;
     
     if (!targetUrl) {
       return res.status(400).json({ error: "targetUrl is required" });
+    }
+    if (swarmStopped) {
+      return res.status(409).json({ error: "Swarm is stopped. Deploy first." });
     }
 
     const tinyfishKey = process.env.TINYFISH_API_KEY;
@@ -965,21 +1544,29 @@ async function startServer() {
       return res.status(500).json({ error: "TINYFISH_API_KEY is not configured" });
     }
 
-    // Add to queue and process in background
+    const taskConfig = config as TaskConfig | undefined;
+    const taskMode = mode === "extract" ? "extract" : "discover";
     if (!agentQueue.find(t => t.url === targetUrl)) {
-      agentQueue.push({ url: targetUrl, proxy });
+      agentQueue.push({ url: targetUrl, proxy, mode: taskMode, config: taskConfig });
       processQueue();
     }
 
-    res.json({ status: "QUEUED", message: "Agent deployed in background" });
+    res.json({ status: "QUEUED", message: `Agent deployed (${taskMode})` });
   });
 
   app.get("/api/agent/active-runs", (req, res) => {
-    res.json(Array.from(activeRuns.entries()).map(([id, data]) => ({ 
-      id, 
-      streamingUrl: data.streamingUrl,
-      status: data.status 
-    })));
+    if (swarmStopped) return res.json([]);
+    const runs = Array.from(activeRuns.entries())
+      .filter(([, data]) => !data.aborted && (data.status === "RUNNING" || data.status === "PENDING"))
+      .map(([id, data], idx) => ({ 
+        id, 
+        agentLabel: `TinyFish ${idx + 1}`,
+        streamingUrl: data.streamingUrl,
+        status: data.status,
+        targetUrl: data.targetUrl || null,
+        mode: data.mode || "discover"
+      }));
+    res.json(runs);
   });
 
   app.get("/api/agent/stream/:runId", async (req, res) => {
@@ -1013,17 +1600,13 @@ async function startServer() {
   });
 
   app.post("/api/agent/stop", (req, res) => {
-    // Clear queue
+    broadcastLog("[Swarm] Stop requested");
+    swarmStopped = true;
+    deployStartTime = null;
     agentQueue.length = 0;
-    
-    // Mark all active runs as aborted
-    for (const [id, run] of activeRuns.entries()) {
-      activeRuns.set(id, { ...run, aborted: true });
-    }
-    
-    // Force reset active count (the loops will exit on next poll)
+    agentCounter = 0;
     activeAgents = 0;
-    
+    activeRuns.clear(); // Remove all runs so agent numbering resets on next deploy
     res.json({ status: "STOPPED", message: "Agent queue cleared and active runs signaled to stop" });
   });
 
@@ -1082,14 +1665,6 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    const tfKey = process.env.TINYFISH_API_KEY;
-    const claudeKey = process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_API_KEY;
-    const geminiKey = process.env.GEMINI_API_KEY;
-    console.log(`[Startup] TinyFish API Key: ${tfKey ? tfKey.substring(0, 4) + '...' : 'MISSING'}`);
-    console.log(`[Startup] Claude API Key: ${claudeKey ? claudeKey.substring(0, 8) + '...' : 'MISSING'}`);
-    if (geminiKey && !claudeKey) {
-      console.log(`[Startup] ⚠️  GEMINI_API_KEY est défini mais l'app utilise CLAUDE_API_KEY.`);
-    }
   });
 }
 

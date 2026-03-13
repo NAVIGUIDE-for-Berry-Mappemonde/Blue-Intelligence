@@ -1,5 +1,33 @@
 @import "tailwindcss";
 
+/* Safari: ensure full height and flex work correctly */
+html {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  -webkit-text-size-adjust: 100%;
+}
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+#root {
+  height: 100%;
+  min-height: 100%;
+  overflow: hidden;
+}
+
+/* Leaflet: remove default margin, force full size. En vue monde, Web Mercator (carré) laisse des bandes (letterboxing) : fond sombre pour qu'elles se fondent */
+.leaflet-container {
+  margin: 0 !important;
+  padding: 0 !important;
+  height: 100% !important;
+  width: 100% !important;
+  background: #0f172a !important; /* slate-900, même couleur que l'app */
+}
+
 .custom-popup .leaflet-popup-content-wrapper {
   background-color: #ffffff;
   color: #0f172a;
