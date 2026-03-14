@@ -10,8 +10,10 @@
     "last 2 Edge versions"
   ],
   "scripts": {
-"start": "NODE_ENV=production tsx server.ts",
+    "start": "NODE_ENV=production tsx server.ts",
     "dev": "tsx server.ts",
+    "copy:markercluster": "mkdir -p public/images/markercluster && (test -d node_modules/leaflet.markercluster/dist/images && cp node_modules/leaflet.markercluster/dist/images/*.png public/images/markercluster/ || true)",
+    "prebuild": "npm run copy:markercluster",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",

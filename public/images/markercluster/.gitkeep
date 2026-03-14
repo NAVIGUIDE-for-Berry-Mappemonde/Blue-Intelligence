@@ -1,0 +1,3 @@
+# Images markercluster (0.png, 1.png, 2.png, 3.png) si leaflet.markercluster les fournit.
+# Les erreurs 400 sur 0.png etc. venaient probablement des tuiles Carto (coordonnée y).
+# OSM est maintenant utilisé → correctif principal.
