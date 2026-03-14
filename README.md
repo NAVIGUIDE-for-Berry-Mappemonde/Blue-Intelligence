@@ -2,7 +2,7 @@
 
 # Blue Intelligence
 
-**Maritime OSINT Swarm** — Autonomous mapping of marine conservation projects
+**Maritime AI OSINT Swarm** — Autonomous mapping of marine conservation projects
 
 <br />
 
