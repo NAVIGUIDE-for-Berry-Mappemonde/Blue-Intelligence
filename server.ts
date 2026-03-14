@@ -852,7 +852,7 @@ async function gatekeeperOnly(markdown: string, url: string, modelOverride?: str
 
 const CLAUDE_EXTRACT_MODEL = process.env.CLAUDE_EXTRACT_MODEL || "claude-sonnet-4-5-20250929";
 const CLAUDE_GATEKEEPER_MODEL = process.env.CLAUDE_GATEKEEPER_MODEL || "claude-haiku-4-5-20251001";
-const EXTRACT_CONCURRENCY = Math.max(1, Math.min(20, parseInt(process.env.EXTRACT_CONCURRENCY || "8", 10)));
+const EXTRACT_CONCURRENCY = Math.max(1, Math.min(20, parseInt(process.env.EXTRACT_CONCURRENCY || "2", 10)));
 
 /** Run async tasks with limited concurrency (worker pool). */
 async function runWithConcurrency<T>(

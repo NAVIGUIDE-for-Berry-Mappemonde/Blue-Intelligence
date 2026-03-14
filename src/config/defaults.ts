@@ -47,8 +47,8 @@ export const DEFAULT_CONFIG = {
     maxConcurrentAgents: 2,
   },
   extraction: {
-    /** Nombre d'extractions Readability+Claude en parallèle (1–20) */
-    concurrency: 8,
+    /** Nombre d'extractions Readability+Claude en parallèle (1–20). Démo: 2 */
+    concurrency: 2,
     /** Modèle Claude pour le gatekeeper (filtrage marin rapide) */
     claudeGatekeeperModel: "claude-haiku-4-5-20251001",
     /** Modèle Claude pour l'extraction (titre, description, coords, funder) */
