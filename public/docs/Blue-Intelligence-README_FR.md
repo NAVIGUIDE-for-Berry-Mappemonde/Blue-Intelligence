@@ -73,8 +73,8 @@ Pour l'expédition maritime Berry-Mappemonde, Blue Intelligence résout un défi
 ## Fonctionnalités
 
 - **Carte mondiale interactive :** Projets de conservation marine en GeoJSON, clusters, popups avec image
-- **Barre latérale gauche :** Filtre par financeur, liste des projets, Déployer TinyFish Swarm, logs du processus, Exporter GeoJSON, Effacer tous les projets
-- **Barre latérale droite :** Paramètres (GSHHG, modèles Claude, concurrence), Mode aide (?), bascule FR/EN, liens Manuel/README
+- **Barre latérale gauche :** Filtre par financeur, liste des projets, AI Swarm, logs du processus, Exporter GeoJSON, Effacer tous les projets
+- **Barre latérale droite :** Paramètres (GSHHG, modèles Claude, concurrence)—stockés en localStorage, envoyés au serveur lors du déploiement du swarm—Mode aide (?), bascule FR/EN, liens Manuel/README
 - **Tableau de bord Audit :** Télémétrie, taux de succès, extractions échouées avec force‑retry
 - **i18n :** Français et anglais (par défaut : anglais)
 
@@ -109,6 +109,9 @@ Pour l'expédition maritime Berry-Mappemonde, Blue Intelligence résout un défi
 
 ## Liens
 
+- **Discord Blue Intelligence :** https://discord.gg/zQcPgxpH
+- **Discord NAVIGUIDE :** https://discord.gg/UPTWWGtE
+- **Discord Berry-Mappemonde :** https://discord.gg/NsWrxXUQ
 - NAVIGUIDE : https://naviguide.fr
 - Berry-Mappemonde : https://berrymappemonde.org
 - GitHub : https://github.com/NAVIGUIDE-for-Berry-Mappemonde/Blue-Intelligence

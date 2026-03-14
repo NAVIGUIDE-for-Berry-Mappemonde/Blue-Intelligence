@@ -88,20 +88,30 @@ FONCTIONNALITÉS PRINCIPALES
      • Filtrage par financeur (fondations/organisations)
 
   B. Sidebar gauche
-     • Sélecteur : « All X Organizations (Y) » — X = nombre d'organisations
+     • Sélecteur : « All X organizations (Y) » — X = nombre d'organisations
        (MasterSeeds), Y = nombre de projets trouvés
      • Liste des projets filtrés avec coordonnées
-     • Bouton « Deploy ETL Swarm » pour lancer l'extraction automatique
+     • Bouton « AI Swarm » pour lancer l'extraction automatique
 
   C. Sidebar droite (Paramètres)
      • Icône « ? » : active le mode aide (infobulles sur tous les boutons et éléments)
      • Toggle FR/EN : langue de l'interface (anglais par défaut)
      • Liens de téléchargement : Manuel et README en EN et FR
      • Mode clair / sombre
+     • Mode cible : Test (N fondations) ou Complet (tous MasterSeeds + DeepLinkCache)
+     • Proxy : optionnel pour les agents TinyFish
      • Filtrage GSHHG (terre/mer) :
-       - Distance max à la côte pour projet « côtier » (km)
-       - Seuils gatekeeper : marine_threshold, inland_threshold
-     • Persistance des paramètres en localStorage
+       - Distance max à la côte pour projet côtier (km) : 0 = strict (point sur terre = inland),
+         100 = tolérer jusqu'à 100 km de la mer
+       - Score marin min (projets côtiers) : marine_threshold 0–1, en dessous = rejeté
+       - Score marin min (projets inland) : inland_threshold plus strict (ex. 0,9)
+     • Nombre d'agents TinyFish : 1–10, max agents en parallèle pour la découverte
+     • Nombre d'agents Readability : 1–20, extractions Readability+Claude en parallèle
+     • Modèle Gatekeeper : Claude pour filtrage sémantique (rejette terrestre/eau douce). Haiku recommandé.
+     • Modèle Extraction : Claude pour extraire titre, description, coords, financeur. Sonnet recommandé.
+     • Modèle Scoring : Claude pour score S_ocean (technicité, fiabilité, localisation océanique). Sonnet recommandé.
+     • Carte : Zoom min, marqueurs max par niveau de zoom (< 5 : 200, < 8 : 500, sinon : 2000)
+     • Persistance des paramètres en localStorage ; envoyés au serveur lors du déploiement du swarm
 
   D. Filtrage GSHHG
      • Masque terre/mer basé sur NOAA GSHHG (Global Self-consistent Hierarchical
@@ -187,8 +197,9 @@ API ETL
 
 COMMUNAUTÉ
 ----------
-• Serveur Discord NAVIGUIDE / Berry-Mappemonde :
-  https://discord.gg/UPTWWGtE
+• Serveur Discord Blue Intelligence : https://discord.gg/zQcPgxpH
+• Serveur Discord NAVIGUIDE : https://discord.gg/UPTWWGtE
+• Serveur Discord Berry-Mappemonde : https://discord.gg/NsWrxXUQ
 
 • X (Twitter) Berry-Mappemonde :
   https://x.com/BerryMappemonde

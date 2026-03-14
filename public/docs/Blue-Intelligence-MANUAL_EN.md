@@ -73,7 +73,7 @@ Click the **?** icon in the right sidebar to enable Help mode. When ON, every bu
 | **Maritime OSINT Swarm** | Part of the NAVIGUIDE ecosystem—Impact module for the Berry-Mappemonde sailing expedition. |
 | **Target mode** | Test (2): deploys only 2 foundations for quick validation. Full: deploys all MasterSeeds (65+) plus DeepLinkCache pages. |
 | **Proxy** | Optional proxy location for TinyFish agents. Use when target sites restrict access by region. |
-| **Deploy TinyFish Swarm** | Launches the ETL swarm. TinyFish agents discover project URLs from MasterSeeds and DeepLinkCache, then extract via Readability + Claude. Implements recursive « Follow the Money » discovery. |
+| **AI Swarm** | Launches the ETL swarm. TinyFish agents discover project URLs from MasterSeeds and DeepLinkCache, then extract via Readability + Claude. Implements recursive « Follow the Money » discovery. |
 | **Clear database before starting** | If checked, deletes all projects before deploying. Use for a fresh start. |
 | **Stop Swarm** | Stops all active TinyFish agents, clears the queue, and aborts ongoing extractions. |
 | **Process logs** | Real-time logs of the ETL pipeline: deploy, discovery, extraction, data flow. |
@@ -84,7 +84,7 @@ Click the **?** icon in the right sidebar to enable Help mode. When ON, every bu
 | **Filtered Projects** | Number of projects matching the current funder filter. Displayed on the map as markers. |
 | **Export GeoJSON** | Downloads the filtered projects as a GeoJSON FeatureCollection. Use in QGIS, MapLibre, or any GIS tool. |
 | **Clear All Projects** | Deletes all projects from the database. Disabled while swarm is running. |
-| **Settings** | GSHHG marine filtering, Claude models, extraction concurrency, documentation downloads. |
+| **Settings** | GSHHG marine filtering, Claude models, extraction concurrency, documentation downloads. Stored in browser localStorage; sent to server when swarm is deployed. |
 | **Help (?)** | Toggle help mode. When ON, every element shows a detailed tooltip on hover. |
 | **Coast distance (km)** | 0 = strict (point on land = inland). 100 = allow up to 100 km from sea. |
 | **Marine / Inland thresholds** | Gatekeeper: minimum marine_relevance (0–1) for coastal vs inland projects. |
@@ -103,7 +103,7 @@ Click the **?** icon in the right sidebar to enable Help mode. When ON, every bu
 2. Run `npm run download-gshhg` then `npm run dev`
 3. Open http://localhost:3000
 4. (Optional) Enable Help mode (?) to explore tooltips
-5. Click **Deploy TinyFish Swarm** to start extraction
+5. Click **AI Swarm** to start extraction
 6. Use **Export GeoJSON** to download results
 
 ---
@@ -113,10 +113,47 @@ Click the **?** icon in the right sidebar to enable Help mode. When ON, every bu
 - **Inputs:** MasterSeeds.json, DeepLinkCacheProjectsLists.json, DeepLinkCacheProjectsPages.json
 - **Discovery:** TinyFish agents explore site trees, inject new URLs into caches
 - **Scraping:** Readability.js cleans HTML before Claude
-- **Transformation:** Claude Haiku gatekeeper → Claude Sonnet extract+geocode → S_ocean scoring
+- **Transformation:** Claude Gatekeeper (Haiku) → Claude Extraction (Sonnet) → Claude Scoring (Sonnet) S_ocean
 - **Coastal snapping:** Inland coordinates snapped to nearest maritime zone
 - **Deduplication:** URL match, < 500 m proximity, semantic similarity
 - **Output:** GeoJSON stream to map
+
+---
+
+## 6. Parameters Reference
+
+### GSHHG (Marine Filtering)
+
+- **Coast distance (km):** Max distance from sea to consider a project "coastal". 0 = strict (point on land = inland). 100 = allow projects up to 100 km from coast. Used with NOAA GSHHG to classify coastal vs inland for threshold application.
+- **Min marine score (coastal):** Gatekeeper threshold 0–1. Projects below are rejected. Lower = more permissive.
+- **Min marine score (inland):** Stricter threshold for projects far from coast. E.g. 0.9 to reject terrestrial/freshwater initiatives.
+
+### Claude Models (3-stage pipeline)
+
+- **Gatekeeper model:** Semantic filter. Rejects purely terrestrial (forests) or freshwater (lakes) projects. Ensures only true "Blue" initiatives enter the system. Haiku recommended (fast, cheap).
+- **Extraction model:** Extracts title, description, coordinates, funder from cleaned HTML. Performs coastal snapping if coordinates land inland. Sonnet recommended for quality.
+- **Scoring model:** Computes S_ocean score (0–1): technicality, source reliability, oceanic localization. Sonnet recommended.
+
+### Agents & Concurrency
+
+- **Number of TinyFish agents:** 1–10. Max TinyFish agents in parallel for discovery (browsing foundation sites).
+- **Number of Readability agents:** 1–20. Readability+Claude extractions in parallel. Higher = faster but more API load.
+
+### Map
+
+- **Zoom min:** Minimum zoom level of the map.
+- **Max markers:** Spatial sampling by zoom. Zoom < 5: 200 markers; < 8: 500; else: 2000. Fewer when zoomed out for performance.
+
+---
+
+## Links
+
+- **Blue Intelligence Discord:** https://discord.gg/zQcPgxpH
+- **NAVIGUIDE Discord:** https://discord.gg/UPTWWGtE
+- **Berry-Mappemonde Discord:** https://discord.gg/NsWrxXUQ
+- NAVIGUIDE: https://naviguide.fr
+- Berry-Mappemonde: https://berrymappemonde.org
+- GitHub: https://github.com/NAVIGUIDE-for-Berry-Mappemonde/Blue-Intelligence
 
 ---
 

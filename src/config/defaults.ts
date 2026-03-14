@@ -43,7 +43,7 @@ export const DEFAULT_CONFIG = {
     testModeDiscover: 2,
     /** Nombre d'URLs extract en mode test */
     testModeExtract: 3,
-    /** Nombre max d'agents TinyFish en parallèle (1–2, limite API TinyFish) */
+    /** Nombre max d'agents TinyFish en parallèle (1–10, défaut 2) */
     maxConcurrentAgents: 2,
   },
   extraction: {
@@ -51,8 +51,10 @@ export const DEFAULT_CONFIG = {
     concurrency: 8,
     /** Modèle Claude pour le gatekeeper (filtrage marin rapide) */
     claudeGatekeeperModel: "claude-haiku-4-5-20251001",
-    /** Modèle Claude pour l'extraction et le scoring */
+    /** Modèle Claude pour l'extraction (titre, description, coords, funder) */
     claudeExtractModel: "claude-sonnet-4-5-20250929",
+    /** Modèle Claude pour le scoring S_ocean */
+    claudeScoringModel: "claude-sonnet-4-5-20250929",
   },
 };
 

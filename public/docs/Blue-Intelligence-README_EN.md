@@ -73,8 +73,8 @@ For the Berry-Mappemonde sailing expedition, Blue Intelligence solves a critical
 ## Features
 
 - **Interactive world map:** Marine conservation projects in GeoJSON, clusters, popups with image
-- **Left sidebar:** Funder filter, project list, Deploy TinyFish Swarm, process logs, Export GeoJSON, Clear All Projects
-- **Right sidebar:** Settings (GSHHG, Claude models, concurrency), Help mode (?), FR/EN toggle, Manual/README download links
+- **Left sidebar:** Funder filter, project list, AI Swarm, process logs, Export GeoJSON, Clear All Projects
+- **Right sidebar:** Settings (GSHHG, Claude models, concurrency)—stored in browser localStorage, sent to server on swarm deploy—Help mode (?), FR/EN toggle, Manual/README download links
 - **Audit dashboard:** Telemetry, success rate, failed extractions with force-retry
 - **i18n:** French and English (default: English)
 
@@ -109,6 +109,9 @@ For the Berry-Mappemonde sailing expedition, Blue Intelligence solves a critical
 
 ## Links
 
+- **Blue Intelligence Discord:** https://discord.gg/zQcPgxpH
+- **NAVIGUIDE Discord:** https://discord.gg/UPTWWGtE
+- **Berry-Mappemonde Discord:** https://discord.gg/NsWrxXUQ
 - NAVIGUIDE: https://naviguide.fr
 - Berry-Mappemonde: https://berrymappemonde.org
 - GitHub: https://github.com/NAVIGUIDE-for-Berry-Mappemonde/Blue-Intelligence

@@ -86,7 +86,7 @@ MAIN FEATURES
      • Filtering by funder (foundations/organizations)
 
   B. Left sidebar
-     • Selector: "All X Organizations (Y)" — X = number of organizations
+     • Selector: "All X organizations (Y)" — X = number of organizations
        (MasterSeeds), Y = number of projects found
      • Filtered project list with coordinates
      • "Deploy ETL Swarm" button to launch automatic extraction
@@ -96,10 +96,20 @@ MAIN FEATURES
      • FR/EN toggle: interface language (English by default)
      • Download links: Manual and README in EN and FR
      • Light / dark mode
+     • Target mode: Test (N foundations) or Full (all MasterSeeds + DeepLinkCache)
+     • Proxy: optional for TinyFish agents
      • GSHHG filtering (land/sea):
-       - Max distance to coast for "coastal" project (km)
-       - Gatekeeper thresholds: marine_threshold, inland_threshold
-     • Parameter persistence in localStorage
+       - Max distance to coast for coastal project (km): 0 = strict (point on land = inland),
+         100 = allow up to 100 km from sea
+       - Min marine score (coastal projects): marine_threshold 0–1, below = rejected
+       - Min marine score (inland projects): inland_threshold stricter (e.g. 0.9)
+     • Number of TinyFish agents: 1–10, max agents in parallel for discovery
+     • Number of Readability agents: 1–20, Readability+Claude extractions in parallel
+     • Gatekeeper model: Claude for semantic filtering (rejects terrestrial/freshwater). Haiku recommended.
+     • Extraction model: Claude for extracting title, description, coords, funder. Sonnet recommended.
+     • Scoring model: Claude for S_ocean score (technicality, reliability, oceanic localization). Sonnet recommended.
+     • Map: Zoom min, max markers per zoom level (< 5: 200, < 8: 500, else: 2000)
+     • Parameter persistence in localStorage; sent to server on swarm deploy
 
   D. GSHHG filtering
      • Land/sea mask based on NOAA GSHHG (Global Self-consistent Hierarchical
@@ -184,8 +194,9 @@ ETL API
 
 COMMUNITY
 ---------
-• NAVIGUIDE / Berry-Mappemonde Discord server:
-  https://discord.gg/UPTWWGtE
+• Blue Intelligence Discord server: https://discord.gg/zQcPgxpH
+• NAVIGUIDE Discord server: https://discord.gg/UPTWWGtE
+• Berry-Mappemonde Discord server: https://discord.gg/NsWrxXUQ
 
 • X (Twitter) Berry-Mappemonde:
   https://x.com/BerryMappemonde

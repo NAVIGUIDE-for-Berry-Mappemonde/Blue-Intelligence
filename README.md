@@ -55,6 +55,7 @@
 - 🌊 **3-stage pipeline** — Haiku gatekeeper → Sonnet extract → S_ocean scoring
 - 📍 **Coastal snapping** — Coordinates recalculated to maritime zones
 - 🔄 **100% local** — SQLite, runs entirely on your machine
+- ⚙️ **Parameters** — Stored in browser (localStorage), sent to server on swarm deploy
 
 ---
 
@@ -82,6 +83,9 @@ Open [http://localhost:3000](http://localhost:3000).
 
 | | |
 |---|---|
+| **Blue Intelligence Discord** | [discord.gg/zQcPgxpH](https://discord.gg/zQcPgxpH) |
+| **NAVIGUIDE Discord** | [discord.gg/UPTWWGtE](https://discord.gg/UPTWWGtE) |
+| **Berry-Mappemonde Discord** | [discord.gg/NsWrxXUQ](https://discord.gg/NsWrxXUQ) |
 | **NAVIGUIDE** | [naviguide.fr](https://naviguide.fr) |
 | **Berry-Mappemonde** | [berrymappemonde.org](https://berrymappemonde.org) |
 | **GitHub** | [NAVIGUIDE-for-Berry-Mappemonde/Blue-Intelligence](https://github.com/NAVIGUIDE-for-Berry-Mappemonde/Blue-Intelligence) |

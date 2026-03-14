@@ -229,16 +229,20 @@ Return ONLY a valid JSON object:
 `;
 
 type GatekeeperConfig = { marine_threshold?: number; inland_threshold?: number; coast_distance_km?: number };
-type ExtractionConfig = { concurrency?: number; claudeGatekeeperModel?: string; claudeExtractModel?: string };
+type ExtractionConfig = { concurrency?: number; claudeGatekeeperModel?: string; claudeExtractModel?: string; claudeScoringModel?: string };
 type AgentConfig = { maxConcurrentAgents?: number };
 type TaskConfig = { gatekeeper?: GatekeeperConfig; extraction?: ExtractionConfig; agent?: AgentConfig };
-const agentQueue: { url: string; proxy?: string; mode?: "discover" | "extract"; config?: TaskConfig }[] = [];
+const agentQueue: { url: string; proxy?: string; mode?: "discover" | "extract"; useTinyFish?: boolean; config?: TaskConfig }[] = [];
 let activeAgents = 0;
-let maxConcurrentAgents = 4; // Surchargé par config.agent.maxConcurrentAgents au deploy
+let maxConcurrentAgents = 2; // Surchargé par config.agent.maxConcurrentAgents au deploy
 
 // Store active runs for SSE proxying and cancellation
 let agentCounter = 0;
+let extractCounter = 0;
 const activeRuns = new Map<string, { streamingUrl: string, logs: any[], aborted?: boolean, status?: string, targetUrl?: string, mode?: string, agentLabel?: string }>();
+const activeExtractRuns = new Map<string, { targetUrl: string; status: string; agentLabel: string }>();
+let hybridExtractCounter = 0;
+const activeHybridExtractions = new Map<string, { targetUrl: string; agentLabel: string; totalUrls: number }>();
 
 // When true, GET /api/agent/active-runs returns [] until next deploy (prevents stale poll data)
 // Start stopped so hard reload / server restart shows clean state (no ghost agents)
@@ -247,14 +251,30 @@ let swarmStopped = true;
 // Mesure du temps de processus (deploy → dernière tâche terminée)
 let deployStartTime: number | null = null;
 
+// Extraction hybride en arrière-plan (ne bloque pas le slot TinyFish)
+let extractingCount = 0;
+
+function checkSwarmComplete() {
+  if (deployStartTime && activeAgents === 0 && agentQueue.length === 0 && extractingCount === 0) {
+    const elapsedSec = ((Date.now() - deployStartTime) / 1000).toFixed(1);
+    broadcastLog({ key: "etl_swarm_done", sec: elapsedSec });
+    console.log(`[Swarm] Process completed in ${elapsedSec}s`);
+    deployStartTime = null;
+  }
+}
+
 /** Extract-only: Readability + Claude pipeline (no TinyFish). Used for Pages cache URLs. */
 async function runExtractOnly(projectUrl: string, taskConfig?: TaskConfig): Promise<number> {
   if (swarmStopped) return 0;
+  extractCounter++;
+  const extractId = `extract-${extractCounter}`;
+  const label = `Readability.js ${extractCounter}`;
+  activeExtractRuns.set(extractId, { targetUrl: projectUrl, status: "RUNNING", agentLabel: label });
   try {
     const host = (() => { try { return new URL(projectUrl).hostname; } catch { return projectUrl.slice(0, 30); } })();
     broadcastLog({ key: "etl_fetch", host });
-    const { markdown, method } = await fetchMarkdown(projectUrl);
-    const projectData = await extractProjectData(markdown, projectUrl, taskConfig?.extraction);
+    const { markdown, method, imageUrls } = await fetchMarkdown(projectUrl);
+    const projectData = await extractProjectData(markdown, projectUrl, taskConfig?.extraction, imageUrls);
     if (swarmStopped) return 0;
     const gatekeeper = passesMarineGatekeeper(projectData, taskConfig?.gatekeeper);
     if (!gatekeeper.pass) {
@@ -286,21 +306,30 @@ async function runExtractOnly(projectUrl: string, taskConfig?: TaskConfig): Prom
   } catch (err: any) {
     console.error(`[Extract] Error for ${projectUrl}:`, err.message);
     throw err;
+  } finally {
+    activeExtractRuns.delete(extractId);
   }
 }
 
 function processQueue() {
-  while (!swarmStopped && activeAgents < maxConcurrentAgents && agentQueue.length > 0) {
-    activeAgents++;
-    const task = agentQueue.shift()!;
+  while (!swarmStopped && agentQueue.length > 0) {
+    const task = agentQueue[0];
     const mode = task.mode || "discover";
+    const useTinyFish = task.useTinyFish === true;
+    const atAgentLimit = activeAgents >= maxConcurrentAgents;
+    const atTinyFishLimit = (mode === "discover" || useTinyFish) && activeRuns.size >= maxConcurrentAgents;
+    if (atAgentLimit || atTinyFishLimit) break;
+    activeAgents++;
+    agentQueue.shift();
     const shortUrl = task.url.length > 45 ? task.url.slice(0, 42) + "…" : task.url;
     if (mode === "extract") {
       broadcastLog({ key: "etl_extract_only", url: shortUrl });
     }
     (async () => {
       try {
-        if (mode === "extract") {
+        if (mode === "extract" && useTinyFish) {
+          await runTinyFishAgent(task.url, task.proxy, 0, "extract", task.config);
+        } else if (mode === "extract") {
           await runExtractOnly(task.url, task.config);
         } else {
           await runTinyFishAgent(task.url, task.proxy, 0, "discover", task.config);
@@ -310,12 +339,7 @@ function processQueue() {
       } finally {
         activeAgents--;
         processQueue();
-        if (deployStartTime && activeAgents === 0 && agentQueue.length === 0) {
-          const elapsedSec = ((Date.now() - deployStartTime) / 1000).toFixed(1);
-          broadcastLog({ key: "etl_swarm_done", sec: elapsedSec });
-          console.log(`[Swarm] Process completed in ${elapsedSec}s`);
-          deployStartTime = null;
-        }
+        checkSwarmComplete();
       }
     })();
   }
@@ -437,6 +461,30 @@ function upsertProject(p: ProjectRow): "inserted" | "updated" | "skipped" {
   const description = p.description || "";
   const funder = Array.isArray(p.funder) ? p.funder.join(", ") : (p.funder || "");
   const projectUrl = p.url || `internal://${title.replace(/[^\w]/g, "-").toLowerCase()}-${lat}-${lng}`;
+
+  const existingByUrl = db.prepare("SELECT id FROM projects WHERE url = ?").get(projectUrl) as { id: number } | undefined;
+  if (existingByUrl) {
+    const existing = db.prepare("SELECT funder FROM projects WHERE id = ?").get(existingByUrl.id) as { funder: string } | undefined;
+    const mergedFunder = existing?.funder
+      ? [...new Set([...existing.funder.split(",").map((f) => f.trim()).filter(Boolean), ...funder.split(",").map((f) => f.trim()).filter(Boolean)])].join(", ")
+      : funder;
+    updateProjectByIdStmt.run(
+      title,
+      description,
+      mergedFunder,
+      lat,
+      lng,
+      p.category || "General",
+      p.status || "Active",
+      p.image_url ?? null,
+      p.start_date ?? null,
+      p.end_date ?? null,
+      p.relevance_score ?? 0.95,
+      p.s_ocean_score ?? 0.75,
+      existingByUrl.id
+    );
+    return "updated";
+  }
 
   const dup = findDuplicateProject({ title, description, lat, lng });
   if (dup) {
@@ -609,7 +657,37 @@ import FirecrawlApp from "@mendable/firecrawl-js";
 
 const turndownService = new TurndownService();
 
-async function fetchMarkdown(url: string): Promise<{ markdown: string, method: string }> {
+/** Extract image URLs from HTML (og:image, twitter:image, first content img). Used as fallback when Claude returns empty. */
+function extractImageUrlsFromHtml(html: string, baseUrl: string): string[] {
+  const urls: string[] = [];
+  try {
+    const doc = new JSDOM(html, { url: baseUrl });
+    const document = doc.window.document;
+    const metaOg = document.querySelector('meta[property="og:image"]');
+    const metaTwitter = document.querySelector('meta[name="twitter:image"], meta[property="twitter:image"]');
+    const firstImg = document.querySelector('article img, main img, [role="main"] img, .content img, .project img, .hero img, img[src*="project"], img[src*="hero"], img');
+    if (metaOg?.getAttribute("content")) {
+      const href = metaOg.getAttribute("content")!.trim();
+      if (href.startsWith("http")) urls.push(href);
+      else urls.push(new URL(href, baseUrl).href);
+    }
+    if (metaTwitter?.getAttribute("content")) {
+      const href = metaTwitter.getAttribute("content")!.trim();
+      if (href.startsWith("http")) urls.push(href);
+      else urls.push(new URL(href, baseUrl).href);
+    }
+    if (firstImg?.getAttribute("src")) {
+      const href = firstImg.getAttribute("src")!.trim();
+      if (href.startsWith("http")) urls.push(href);
+      else urls.push(new URL(href, baseUrl).href);
+    }
+    return [...new Set(urls)];
+  } catch {
+    return [];
+  }
+}
+
+async function fetchMarkdown(url: string): Promise<{ markdown: string, method: string, imageUrls?: string[] }> {
   let html = "";
   try {
     // Niveau 1: Local & Gratuit (Readability)
@@ -625,7 +703,8 @@ async function fetchMarkdown(url: string): Promise<{ markdown: string, method: s
     
     if (article && article.textContent.length > 500) {
       const markdown = turndownService.turndown(article.content);
-      return { markdown, method: 'Readability' };
+      const imageUrls = extractImageUrlsFromHtml(html, url);
+      return { markdown, method: 'Readability', imageUrls };
     } else {
       throw new Error('Content too short or empty (JS-heavy)');
     }
@@ -637,7 +716,8 @@ async function fetchMarkdown(url: string): Promise<{ markdown: string, method: s
       if (html) {
         const markdown = await htmlToMarkdown(html);
         if (markdown && markdown.length > 500) {
-           return { markdown, method: 'Mdream' };
+          const imageUrls = extractImageUrlsFromHtml(html, url);
+          return { markdown, method: 'Mdream', imageUrls };
         }
       }
       throw new Error('Mdream result too short or empty');
@@ -669,7 +749,8 @@ async function fetchMarkdown(url: string): Promise<{ markdown: string, method: s
           const scrapeHtml = await scrapeRes.text();
           const markdown = await htmlToMarkdown(scrapeHtml);
           if (markdown && markdown.length > 500) {
-            return { markdown, method: 'Scrape.do' };
+            const imageUrls = extractImageUrlsFromHtml(scrapeHtml, url);
+            return { markdown, method: 'Scrape.do', imageUrls };
           }
           throw new Error('Scrape.do result too short or empty');
         } catch (scrapeErr: any) {
@@ -802,7 +883,7 @@ async function runWithConcurrency<T>(
 }
 
 /** Stage 2: Claude Sonnet - Analysis, geocoding, coastal snapping. Description < 250 chars */
-async function extractAndGeocode(markdown: string, url: string, modelOverride?: string): Promise<any> {
+async function extractAndGeocode(markdown: string, url: string, modelOverride?: string, imageUrls?: string[]): Promise<any> {
   const apiKey = process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error("CLAUDE_API_KEY (or ANTHROPIC_API_KEY) is not configured");
   const client = new Anthropic({ apiKey });
@@ -820,6 +901,7 @@ RULES:
 - If coordinates (lat,lng) are INLAND (Paris, Geneva, US Midwest), apply COASTAL SNAPPING: recalculate to nearest maritime/coastal point.
 - marine_relevance 0-1, location_type coastal|inland|unknown
 - image_url: extract ANY project-related image. Prefer: og:image meta, first img/figure in content, hero/banner images, logos, diagrams. Use absolute URLs. If the page links to PDFs with images, use the PDF URL or an image URL from the same domain. Empty string only if no image found.
+${imageUrls && imageUrls.length > 0 ? `\nAvailable images from page metadata (use the most relevant): ${imageUrls.slice(0, 5).join(", ")}` : ""}
 
 Return ONLY valid JSON (no markdown, no explanation):
 {"title":"string","url":"string","description":"string","funder":"string","lat":number,"lng":number,"category":"string","status":"string","image_url":"string","start_date":"string","end_date":"string","marine_relevance":number,"location_type":"coastal|inland|unknown"}
@@ -834,6 +916,9 @@ ${markdown.slice(0, 12000)}`
   const data = JSON.parse(jsonMatch ? jsonMatch[0] : "{}");
   if (data.marine_relevance === undefined) data.marine_relevance = 0.95;
   if (data.location_type === undefined) data.location_type = "unknown";
+  if ((!data.image_url || data.image_url.trim() === "") && imageUrls && imageUrls.length > 0) {
+    data.image_url = imageUrls[0];
+  }
   return data;
 }
 
@@ -860,17 +945,19 @@ async function scoreSOcean(projectData: any, modelOverride?: string): Promise<nu
 }
 
 /** Full 3-stage pipeline: Haiku gatekeeper → Sonnet extract+coastal snapping → Sonnet S_ocean */
-async function extractProjectData(markdown: string, url: string, extractionConfig?: ExtractionConfig) {
+async function extractProjectData(markdown: string, url: string, extractionConfig?: ExtractionConfig, imageUrls?: string[]) {
   const gatekeeperModel = extractionConfig?.claudeGatekeeperModel || CLAUDE_GATEKEEPER_MODEL;
   const extractModel = extractionConfig?.claudeExtractModel || CLAUDE_EXTRACT_MODEL;
   const gatekeeper = await gatekeeperOnly(markdown, url, gatekeeperModel);
   if (!gatekeeper.pass) {
     throw new Error(`Gatekeeper rejected: marine_relevance=${gatekeeper.marine_relevance}`);
   }
-  const projectData = await extractAndGeocode(markdown, url, extractModel);
+  const projectData = await extractAndGeocode(markdown, url, extractModel, imageUrls);
   projectData.marine_relevance = gatekeeper.marine_relevance;
   projectData.location_type = gatekeeper.location_type;
-  projectData.s_ocean_score = await scoreSOcean(projectData, extractModel);
+  const scoringModel = extractionConfig?.claudeScoringModel || extractionConfig?.claudeExtractModel || CLAUDE_EXTRACT_MODEL;
+  projectData.s_ocean_score = await scoreSOcean(projectData, scoringModel);
+  if (!projectData.url || projectData.url.trim() === "") projectData.url = url;
   return projectData;
 }
 
@@ -1143,91 +1230,105 @@ async function runTinyFishAgent(targetUrl: string, proxy?: string, retryCount = 
         const extractConcurrency = taskConfig?.extraction?.concurrency ?? EXTRACT_CONCURRENCY;
         broadcastLog({ key: "etl_cache_updated", n: urls.length });
         broadcastLog({ key: "etl_pipeline", n: urls.length, c: extractConcurrency });
-        console.log(`[TinyFish] Discovered ${urls.length} URLs for ${targetUrl}. Starting hybrid extraction (concurrency=${extractConcurrency})...`);
-        // ETL: Inject into structural memory
+        console.log(`[TinyFish] Discovered ${urls.length} URLs for ${targetUrl}. Starting hybrid extraction in background (slot freed for next agent)...`);
         appendToDeepLinkCache("DeepLinkCacheProjectsLists.json", [targetUrl]);
         if (urls.length > 0) appendToDeepLinkCache("DeepLinkCacheProjectsPages.json", urls);
-        
-        const successCount = await runWithConcurrency(urls, extractConcurrency, async (projectUrl, i) => {
-          if (swarmStopped || activeRuns.get(runId)?.aborted) return 0;
+
+        activeRuns.delete(runId);
+        extractingCount++;
+        hybridExtractCounter++;
+        const hybridId = `hybrid-${hybridExtractCounter}`;
+        const hybridLabel = `Readability.js ${hybridExtractCounter}`;
+        activeHybridExtractions.set(hybridId, { targetUrl, agentLabel: hybridLabel, totalUrls: urls.length });
+        (async () => {
+          const discoverStartTime = startTime;
           try {
-            const host = (() => { try { return new URL(projectUrl).hostname; } catch { return projectUrl.slice(0, 30); } })();
-            broadcastLog({ key: "etl_fetch_n", i: i + 1, total: urls.length, host });
-            const { markdown, method } = await fetchMarkdown(projectUrl);
-            const projectData = await extractProjectData(markdown, projectUrl, taskConfig?.extraction);
-
-            const gatekeeper = passesMarineGatekeeper(projectData, taskConfig?.gatekeeper);
-            if (!gatekeeper.pass) {
-              console.log(`[Gatekeeper] REJECTED ${projectUrl}: ${gatekeeper.reason}`);
+            const successCount = await runWithConcurrency(urls, extractConcurrency, async (projectUrl, i) => {
+              if (swarmStopped) return 0;
               try {
-                db.prepare(`
-                  INSERT INTO failed_extractions (target_url, project_url, error_message)
-                  VALUES (?, ?, ?)
-                  ON CONFLICT(project_url) DO UPDATE SET
-                    error_message = excluded.error_message,
-                    created_at = CURRENT_TIMESTAMP
-                `).run(targetUrl, projectUrl, gatekeeper.reason!);
-              } catch (dbErr) {}
-              return 0;
-            }
+                const host = (() => { try { return new URL(projectUrl).hostname; } catch { return projectUrl.slice(0, 30); } })();
+                broadcastLog({ key: "etl_fetch_n", i: i + 1, total: urls.length, host });
+                const { markdown, method, imageUrls } = await fetchMarkdown(projectUrl);
+                const projectData = await extractProjectData(markdown, projectUrl, taskConfig?.extraction, imageUrls);
 
-            if (swarmStopped) return 0;
-            const relevanceScore = typeof projectData.marine_relevance === "number" ? projectData.marine_relevance : 0.95;
-            broadcastLog({ key: "etl_claude_extract", title: (projectData.title || "?").slice(0, 40) });
-            const upsertResult = upsertProject({
-              title: projectData.title || 'Unknown',
-              url: projectData.url || projectUrl,
-              description: projectData.description || '',
-              funder: projectData.funder || 'Unknown',
-              lat: projectData.lat || 0,
-              lng: projectData.lng || 0,
-              category: projectData.category || 'Marine Conservation',
-              status: projectData.status || 'Active',
-              image_url: projectData.image_url || '',
-              start_date: projectData.start_date || null,
-              end_date: projectData.end_date || null,
-              relevance_score: relevanceScore,
-              s_ocean_score: projectData.s_ocean_score ?? 0.75,
-            });
-            
-            try {
-              db.prepare(`DELETE FROM failed_extractions WHERE project_url = ?`).run(projectUrl);
-            } catch (e) {}
-            
-            if (upsertResult !== "skipped") {
-              broadcastLog({ key: "etl_saved", title: (projectData.title || "?").slice(0, 35) });
-            }
-            console.log(`[Extraction] ${i+1}/${urls.length} URL traitée via (${method}) [marine=${relevanceScore.toFixed(2)}]${upsertResult === "updated" ? " [dédoublonné]" : ""}: ${projectUrl}`);
-            return upsertResult !== "skipped" ? 1 : 0;
+                const gatekeeper = passesMarineGatekeeper(projectData, taskConfig?.gatekeeper);
+                if (!gatekeeper.pass) {
+                  console.log(`[Gatekeeper] REJECTED ${projectUrl}: ${gatekeeper.reason}`);
+                  try {
+                    db.prepare(`
+                      INSERT INTO failed_extractions (target_url, project_url, error_message)
+                      VALUES (?, ?, ?)
+                      ON CONFLICT(project_url) DO UPDATE SET
+                        error_message = excluded.error_message,
+                        created_at = CURRENT_TIMESTAMP
+                    `).run(targetUrl, projectUrl, gatekeeper.reason!);
+                  } catch (dbErr) {}
+                  return 0;
+                }
+
+                if (swarmStopped) return 0;
+                const relevanceScore = typeof projectData.marine_relevance === "number" ? projectData.marine_relevance : 0.95;
+                broadcastLog({ key: "etl_claude_extract", title: (projectData.title || "?").slice(0, 40) });
+                const upsertResult = upsertProject({
+                  title: projectData.title || 'Unknown',
+                  url: projectData.url || projectUrl,
+                  description: projectData.description || '',
+                  funder: projectData.funder || 'Unknown',
+                  lat: projectData.lat || 0,
+                  lng: projectData.lng || 0,
+                  category: projectData.category || 'Marine Conservation',
+                  status: projectData.status || 'Active',
+                  image_url: projectData.image_url || '',
+                  start_date: projectData.start_date || null,
+                  end_date: projectData.end_date || null,
+                  relevance_score: relevanceScore,
+                  s_ocean_score: projectData.s_ocean_score ?? 0.75,
+                });
+
+                try {
+                  db.prepare(`DELETE FROM failed_extractions WHERE project_url = ?`).run(projectUrl);
+                } catch (e) {}
+
+                if (upsertResult !== "skipped") {
+                  broadcastLog({ key: "etl_saved", title: (projectData.title || "?").slice(0, 35) });
+                }
+                console.log(`[Extraction] ${i+1}/${urls.length} URL traitée via (${method}) [marine=${relevanceScore.toFixed(2)}]${upsertResult === "updated" ? " [dédoublonné]" : ""}: ${projectUrl}`);
+                return upsertResult !== "skipped" ? 1 : 0;
+              } catch (err: any) {
+                console.error(`[Extraction] Error processing ${projectUrl}:`, err.message);
+                try {
+                  db.prepare(`
+                    INSERT INTO failed_extractions (target_url, project_url, error_message)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(project_url) DO UPDATE SET
+                      error_message = excluded.error_message,
+                      created_at = CURRENT_TIMESTAMP
+                  `).run(targetUrl, projectUrl, err.message);
+                } catch (dbErr) {}
+                return 0;
+              }
+            }, () => swarmStopped);
+
+            const duration = Math.round(performance.now() - discoverStartTime);
+            recordTelemetry('tinyfish', targetUrl, 'SUCCESS', successCount, duration, null, rawResponse);
+            broadcastLog({ key: successCount === 1 ? "etl_extract_one" : "etl_extract_many", n: successCount });
+            console.log(`[TinyFish] Hybrid extraction finished. Saved ${successCount} projects for ${targetUrl}`);
           } catch (err: any) {
-            console.error(`[Extraction] Error processing ${projectUrl}:`, err.message);
-            try {
-              db.prepare(`
-                INSERT INTO failed_extractions (target_url, project_url, error_message)
-                VALUES (?, ?, ?)
-                ON CONFLICT(project_url) DO UPDATE SET
-                  error_message = excluded.error_message,
-                  created_at = CURRENT_TIMESTAMP
-              `).run(targetUrl, projectUrl, err.message);
-            } catch (dbErr) {}
-            return 0;
+            console.error(`[TinyFish] Hybrid extraction error for ${targetUrl}:`, err.message);
+            recordTelemetry('tinyfish', targetUrl, 'ERROR', 0, Math.round(performance.now() - discoverStartTime), err.message);
+          } finally {
+            activeHybridExtractions.delete(hybridId);
+            extractingCount--;
+            checkSwarmComplete();
           }
-        }, () => swarmStopped || activeRuns.get(runId)?.aborted === true);
-        
-        if (activeRuns.get(runId)?.aborted) {
-          console.log(`[TinyFish] Run ${runId} aborted during extraction.`);
-          activeRuns.delete(runId);
-          return;
-        }
-        projectsFound = successCount;
-        broadcastLog({ key: projectsFound === 1 ? "etl_extract_one" : "etl_extract_many", n: projectsFound });
-        console.log(`[TinyFish] Hybrid extraction finished. Saved ${projectsFound} projects for ${targetUrl}`);
+        })();
+        return;
       }
     }
-    
+
     const duration = Math.round(performance.now() - startTime);
     recordTelemetry('tinyfish', targetUrl, 'SUCCESS', projectsFound, duration, null, rawResponse);
-    activeRuns.delete(runId); // Redondant si COMPLETED, mais sécurise les autres chemins
+    activeRuns.delete(runId);
   } catch (error: any) {
     console.error(`[TinyFish] Error for ${targetUrl}:`, error.message);
     const duration = Math.round(performance.now() - startTime);
@@ -1349,6 +1450,38 @@ async function startServer() {
     }
   });
 
+  function hasValidImageUrl(v: string | null | undefined): boolean {
+    if (v == null) return false;
+    const t = String(v).trim();
+    if (t === "" || t === "null" || t === "undefined") return false;
+    if (!t.startsWith("http://") && !t.startsWith("https://")) return false;
+    if (t.length < 12) return false; // "https://x.co" minimum
+    return true;
+  }
+
+  app.get("/api/projects/without-image", (req, res) => {
+    try {
+      const all = db.prepare("SELECT id, title, url, funder, image_url FROM projects ORDER BY id DESC").all() as { id: number; title: string; url: string; funder: string; image_url: string | null }[];
+      const rows = all.filter((p) => !hasValidImageUrl(p.image_url)).map(({ id, title, url, funder }) => ({ id, title, url, funder }));
+      res.json(rows);
+    } catch (error) {
+      console.error("Error fetching projects without image:", error);
+      res.status(500).json({ error: "Failed to fetch" });
+    }
+  });
+
+  app.get("/api/projects/image-stats", (req, res) => {
+    try {
+      const all = db.prepare("SELECT id, image_url FROM projects").all() as { id: number; image_url: string | null }[];
+      const without = all.filter((p) => !hasValidImageUrl(p.image_url));
+      const samples = without.slice(0, 5).map((p) => ({ id: p.id, image_url: p.image_url, repr: JSON.stringify(p.image_url) }));
+      res.json({ total: all.length, withoutImage: without.length, samples });
+    } catch (error) {
+      console.error("Error fetching image stats:", error);
+      res.status(500).json({ error: "Failed to fetch" });
+    }
+  });
+
   app.get("/api/projects/stream", (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -1391,13 +1524,27 @@ async function startServer() {
       agentQueue.length = 0;
       activeAgents = 0;
       agentCounter = 0;
-      activeRuns.clear(); // Remove all runs so agent numbering resets on next deploy
+      activeRuns.clear();
+      activeExtractRuns.clear();
+      activeHybridExtractions.clear();
       db.prepare("DELETE FROM projects").run();
       broadcastLog({ key: "etl_db_cleared" });
       res.json({ status: "ok", message: "All projects cleared" });
     } catch (error) {
       console.error("Error clearing projects:", error);
       res.status(500).json({ error: "Failed to clear projects" });
+    }
+  });
+
+  app.post("/api/audit/clear", (req, res) => {
+    try {
+      db.prepare("DELETE FROM telemetry").run();
+      db.prepare("DELETE FROM failed_extractions").run();
+      broadcastLog({ key: "etl_audit_cleared" });
+      res.json({ status: "ok", message: "Audit data cleared (telemetry + failed extractions)" });
+    } catch (error) {
+      console.error("Error clearing audit:", error);
+      res.status(500).json({ error: "Failed to clear audit data" });
     }
   });
 
@@ -1437,24 +1584,22 @@ async function startServer() {
     if (!projectUrls || !Array.isArray(projectUrls) || projectUrls.length === 0) {
       return res.status(400).json({ error: "projectUrls array is required" });
     }
-    if (swarmStopped) {
-      return res.status(409).json({ error: "Swarm is stopped. Deploy first to queue force-extract." });
-    }
-
     const tinyfishKey = process.env.TINYFISH_API_KEY;
     if (!tinyfishKey) {
-      return res.status(500).json({ error: "TINYFISH_API_KEY is not configured" });
+      return res.status(500).json({ error: "TINYFISH_API_KEY is required for force-extract (re-extraction uses TinyFish to handle PDFs and pages that Readability cannot parse)" });
     }
-
+    // Re-extraction via TinyFish : gère PDFs, 404, pages que Readability ne peut pas parser
+    swarmStopped = false;
     const taskConfig = config as TaskConfig | undefined;
+    maxConcurrentAgents = Math.max(1, Math.min(10, taskConfig?.agent?.maxConcurrentAgents ?? 2));
     for (const url of projectUrls) {
       if (!agentQueue.find(t => t.url === url)) {
-        agentQueue.push({ url, proxy, mode: 'extract', config: taskConfig });
+        agentQueue.push({ url, proxy, mode: 'extract', useTinyFish: true, config: taskConfig });
       }
     }
     processQueue();
 
-    res.json({ status: "QUEUED", message: `${projectUrls.length} agents deployed in background for forced extraction` });
+    res.json({ status: "QUEUED", message: `${projectUrls.length} agents deployed in background for forced extraction (TinyFish)` });
   });
 
   app.get("/api/etl/seeds", (req, res) => {
@@ -1484,12 +1629,16 @@ async function startServer() {
     }
     swarmStopped = false;
     deployStartTime = Date.now();
-    maxConcurrentAgents = Math.max(1, Math.min(2, config?.agent?.maxConcurrentAgents ?? 2));
+    maxConcurrentAgents = Math.max(1, Math.min(10, config?.agent?.maxConcurrentAgents ?? 2));
     broadcastLog({ key: "etl_deploy_start" });
     agentQueue.length = 0;
     activeAgents = 0; // Reset so processQueue can start new tasks immediately
-    agentCounter = 0; // Fresh start: agent numbering begins at 1
+    agentCounter = 0;
+    extractCounter = 0;
+    hybridExtractCounter = 0;
     activeRuns.clear();
+    activeExtractRuns.clear();
+    activeHybridExtractions.clear();
     if (clearBeforeStart) {
       db.prepare("DELETE FROM projects").run();
       broadcastLog({ key: "etl_db_cleared" });
@@ -1564,18 +1713,34 @@ async function startServer() {
   });
 
   app.get("/api/agent/active-runs", (req, res) => {
-    if (swarmStopped) return res.json([]);
-    const runs = Array.from(activeRuns.entries())
+    const tinyFishRuns = swarmStopped ? [] : Array.from(activeRuns.entries())
       .filter(([, data]) => !data.aborted && (data.status === "RUNNING" || data.status === "PENDING"))
-      .map(([id, data], idx) => ({ 
+      .map(([id, data]) => ({ 
         id, 
-        agentLabel: `TinyFish ${idx + 1}`,
+        agentLabel: data.agentLabel || "TinyFish",
         streamingUrl: data.streamingUrl,
         status: data.status,
         targetUrl: data.targetUrl || null,
         mode: data.mode || "discover"
       }));
-    res.json(runs);
+    const extractRuns = Array.from(activeExtractRuns.entries()).map(([id, data]) => ({
+      id,
+      agentLabel: data.agentLabel,
+      streamingUrl: null,
+      status: data.status,
+      targetUrl: data.targetUrl,
+      mode: "extract"
+    }));
+    const hybridRuns = Array.from(activeHybridExtractions.entries()).map(([id, data]) => ({
+      id,
+      agentLabel: data.agentLabel,
+      streamingUrl: null,
+      status: "RUNNING",
+      targetUrl: data.targetUrl,
+      mode: "extract",
+      totalUrls: data.totalUrls
+    }));
+    res.json([...tinyFishRuns, ...extractRuns, ...hybridRuns]);
   });
 
   app.get("/api/agent/stream/:runId", async (req, res) => {
@@ -1615,7 +1780,9 @@ async function startServer() {
     agentQueue.length = 0;
     agentCounter = 0;
     activeAgents = 0;
-    activeRuns.clear(); // Remove all runs so agent numbering resets on next deploy
+    activeRuns.clear();
+    activeExtractRuns.clear();
+    activeHybridExtractions.clear();
     res.json({ status: "STOPPED", message: "Agent queue cleared and active runs signaled to stop" });
   });
 

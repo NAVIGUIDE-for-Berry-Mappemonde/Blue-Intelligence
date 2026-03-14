@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef, useMemo, useCallback, memo } from "react";
 import { MapContainer, TileLayer, GeoJSON, useMapEvents, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
-import { Activity, Globe, Shield, Waves, Play, Loader2, Filter, Download, ExternalLink, AlertCircle, AlertTriangle, RefreshCw, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { Activity, Globe, Shield, Waves, Play, Loader2, Filter, ExternalLink, AlertCircle, AlertTriangle, RefreshCw, PanelLeftClose, PanelLeftOpen, Trash2, FileCode, ImageOff } from "lucide-react";
 import { useConfig } from "./config/useConfig";
 import { SettingsSidebar } from "./components/SettingsSidebar";
 import { loadTheme, saveTheme, type Theme } from "./theme";
@@ -213,6 +213,17 @@ function MapFitWorld() {
   return null;
 }
 
+/** Recalcule la taille de la carte quand une sidebar est toggle (évite le bug de centrage). */
+function MapResizeOnSidebarChange({ sidebarOpen, settingsOpen }: { sidebarOpen: boolean; settingsOpen: boolean }) {
+  const map = useMap();
+  useEffect(() => {
+    const t = setTimeout(() => map.invalidateSize(), 50);
+    const t2 = setTimeout(() => map.invalidateSize(), 300);
+    return () => { clearTimeout(t); clearTimeout(t2); };
+  }, [map, sidebarOpen, settingsOpen]);
+  return null;
+}
+
 /** Viewport culling + zoom limit: updates visible features on pan/zoom */
 function MapViewportHandler({
   allFeatures,
@@ -312,9 +323,9 @@ export default function App() {
   const [selectedFunderFilter, setSelectedFunderFilter] = useState<string>("All");
   const [telemetry, setTelemetry] = useState<any[]>([]);
   const [failedExtractions, setFailedExtractions] = useState<any[]>([]);
+  const [projectsWithoutImage, setProjectsWithoutImage] = useState<{ id: number; title: string; url: string; funder: string }[]>([]);
   const [activeRuns, setActiveRuns] = useState<any[]>([]);
   const [selectedProxy, setSelectedProxy] = useState<string>("");
-  const [clearBeforeStart, setClearBeforeStart] = useState(false);
   const [view, setView] = useState<"map" | "audit">("map");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [settingsSidebarOpen, setSettingsSidebarOpen] = useState(false);
@@ -391,6 +402,16 @@ export default function App() {
     }
   };
 
+  const fetchProjectsWithoutImage = async () => {
+    try {
+      const res = await fetch("/api/projects/without-image");
+      if (res.ok) {
+        const data = await res.json();
+        setProjectsWithoutImage(Array.isArray(data) ? data : []);
+      }
+    } catch (_) {}
+  };
+
   const fetchFailedExtractions = async () => {
     try {
       const res = await fetch("/api/failed-extractions");
@@ -446,12 +467,21 @@ export default function App() {
         }
       });
 
-      // Setup SSE for new runs
+      // Setup SSE for new runs (TinyFish) or placeholder for Readability.js
       data.forEach((run: any) => {
-        if (!eventSources.current[run.id] && run.streamingUrl) {
-          // Set initial log state with full URL
-          const targetUrl = run.targetUrl || "—";
-          const urlDisplay = targetUrl.length > 100 ? targetUrl.slice(0, 97) + "…" : targetUrl;
+        const targetUrl = run.targetUrl || "—";
+        const urlDisplay = targetUrl.length > 100 ? targetUrl.slice(0, 97) + "…" : targetUrl;
+        if (!run.streamingUrl && run.mode === "extract") {
+          const extractMsg = run.totalUrls
+            ? `[${new Date().toLocaleTimeString()}] Extracting ${run.totalUrls} URLs with Readability + Claude (post-discovery)...`
+            : `[${new Date().toLocaleTimeString()}] Extracting with Readability + Claude...`;
+          setLiveLogs(prev => ({
+            ...prev,
+            [run.id]: (prev[run.id] || []).length === 0
+              ? [`[${new Date().toLocaleTimeString()}] Source: ${urlDisplay}`, extractMsg]
+              : prev[run.id]
+          }));
+        } else if (!eventSources.current[run.id] && run.streamingUrl) {
           setLiveLogs(prev => ({
             ...prev,
             [run.id]: (prev[run.id] || []).length === 0
@@ -544,6 +574,7 @@ export default function App() {
     fetchQueueStatus();
     fetchConfigStatus();
     fetchFailedExtractions();
+    fetchProjectsWithoutImage();
     const logEs = new EventSource("/api/logs/stream");
     logEs.onmessage = (e) => {
       try {
@@ -568,6 +599,7 @@ export default function App() {
       fetchTelemetry();
       fetchQueueStatus();
       fetchFailedExtractions();
+      fetchProjectsWithoutImage();
     }, 5000);
     return () => {
       logEs.close();
@@ -590,7 +622,7 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          clearBeforeStart,
+          clearBeforeStart: false,
           testMode: targetMode === "test",
           proxy: selectedProxy,
           config: {
@@ -661,39 +693,26 @@ export default function App() {
     }
   };
 
-  // Extract unique funders for the filter dropdown
-  const uniqueFundersInData = Array.from(new Set((projects?.features ?? []).map((f: any) => f.properties?.funder).filter(Boolean))) as string[];
-  const targetNames = seeds.map(p => p.name);
-  
   // Normalize names to merge duplicates (e.g., "The David..." vs "David...")
-  const normalize = (name: string) => name.replace(/^The\s+/i, '').trim().toLowerCase();
+  const normalize = (name: string) => (name || "").replace(/^The\s+/i, '').trim().toLowerCase();
   
-  const funderMap = new Map<string, { name: string, count: number }>();
-  
-  // Initialize with target names
-  targetNames.forEach(name => {
-    const norm = normalize(name);
-    if (!funderMap.has(norm)) {
-      funderMap.set(norm, { name, count: 0 });
-    }
-  });
-  
-  // Add/Update with data names
-  uniqueFundersInData.forEach(name => {
-    const norm = normalize(name);
-    const count = (projects?.features ?? []).filter((f: any) => f.properties?.funder === name).length;
-    
-    if (funderMap.has(norm)) {
-      const existing = funderMap.get(norm)!;
-      // If the data name has projects, prefer it as the display name
-      if (count > 0) {
-        funderMap.set(norm, { name, count: existing.count + count });
+  // 1 ligne = 1 fondation. Projets co-financés : chaque funder (séparé par virgule) compte pour le projet.
+  const funderMap = new Map<string, { name: string; count: number }>();
+  (projects?.features ?? []).forEach((f: any) => {
+    const funderStr = f.properties?.funder || "";
+    const funderNames = funderStr.split(",").map((s: string) => s.trim()).filter(Boolean);
+    const seen = new Set<string>();
+    funderNames.forEach((funderName: string) => {
+      const norm = normalize(funderName);
+      if (!norm || seen.has(norm)) return;
+      seen.add(norm);
+      const existing = funderMap.get(norm);
+      if (existing) {
+        funderMap.set(norm, { name: existing.name, count: existing.count + 1 });
       } else {
-        funderMap.set(norm, { name: existing.name, count: existing.count + count });
+        funderMap.set(norm, { name: funderName, count: 1 });
       }
-    } else {
-      funderMap.set(norm, { name, count });
-    }
+    });
   });
 
   const fundersWithCounts = (Array.from(funderMap.values()) as { name: string; count: number }[])
@@ -704,7 +723,10 @@ export default function App() {
     () =>
       selectedFunderFilter === "All"
         ? features
-        : features.filter((f: any) => normalize(f.properties?.funder) === normalize(selectedFunderFilter)),
+        : features.filter((f: any) => {
+            const funderStr = f.properties?.funder || "";
+            return funderStr.split(",").map((s: string) => normalize(s.trim())).includes(normalize(selectedFunderFilter));
+          }),
     [features, selectedFunderFilter]
   );
   const [visibleFeatures, setVisibleFeatures] = useState<any[]>([]);
@@ -801,35 +823,11 @@ export default function App() {
           </div>
         )}
 
-        <div className="p-6 flex-1 min-h-0 overflow-y-auto">
-          <div className="mb-8">
-              <div className="flex flex-col gap-2">
-                <div className="grid grid-cols-2 gap-2 mb-2">
-                  <select 
-                    value={targetMode}
-                    onChange={(e) => setTargetMode(e.target.value as "test" | "full")}
-                    disabled={loading}
-                    className={`${leftSidebar.input} rounded-lg p-2 text-xs outline-none disabled:opacity-50 border`}
-                    title={helpMode ? t.targetModeHelp : undefined}
-                  >
-                    <option value="test">Test ({Math.min(2, Math.max(1, config.agent.maxConcurrentAgents ?? 2))})</option>
-                    <option value="full">{t.fullMode} ({seeds.length})</option>
-                  </select>
-                  <select 
-                    value={selectedProxy}
-                    onChange={(e) => setSelectedProxy(e.target.value)}
-                    disabled={loading}
-                    className={`${leftSidebar.input} rounded-lg p-2 text-xs outline-none disabled:opacity-50 border`}
-                    title={helpMode ? t.proxyHelp : undefined}
-                  >
-                    {PROXY_LOCATIONS.map((p, idx) => (
-                      <option key={p.code} value={p.code}>{idx === 0 ? t.noProxy : p.name}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="mb-4 p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg flex flex-col" title={helpMode ? t.processLogsHelp : undefined} style={{ minHeight: "5.5rem" }}>
-                  <div ref={mainLogRef} className="min-h-[3.75rem] overflow-y-auto font-mono text-[10px] leading-[1.25rem] text-blue-600 space-y-0.5 shrink-0">
+        <div className="p-4 flex-1 min-h-0 flex flex-col overflow-hidden">
+          <div className="shrink-0 mb-4">
+              <div className="flex flex-col gap-3">
+                <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg flex flex-col min-h-[5rem] max-h-[8rem] overflow-hidden shrink-0" title={helpMode ? t.processLogsHelp : undefined}>
+                  <div ref={mainLogRef} className="flex-1 min-h-0 overflow-y-auto font-mono text-[10px] leading-[1.25rem] text-blue-600 space-y-0.5">
                     {agentLogs.length === 0 ? (
                       <p className="text-[10px] text-blue-600/70">—</p>
                     ) : (
@@ -863,19 +861,6 @@ export default function App() {
                     {t.deploySwarm}
                   </button>
                   </HelpTooltip>
-                  
-                  <HelpTooltip helpKey="clearBeforeStartHelp" fallbackKey="clearBeforeStart">
-                  <div className="flex items-center gap-2 px-1">
-                    <input 
-                      type="checkbox" 
-                      id="clear-before-start"
-                      checked={clearBeforeStart}
-                      onChange={(e) => setClearBeforeStart(e.target.checked)}
-                      className={`w-3 h-3 rounded border text-blue-600 focus:ring-blue-500 ${isDark ? "bg-slate-950 border-slate-800" : "bg-white border-slate-300"}`}
-                    />
-                    <label htmlFor="clear-before-start" className={`text-[10px] cursor-pointer ${leftSidebar.muted}`}>{t.clearBeforeStart}</label>
-                  </div>
-                  </HelpTooltip>
 
                 {isSwarmRunning && (
                   <HelpTooltip helpKey="stopSwarmHelp" fallbackKey="stopSwarm">
@@ -892,73 +877,90 @@ export default function App() {
               </div>
           </div>
 
-          {/* Live Swarm Console */}
+          {/* Live Swarm Console - scrollable */}
           {(activeRuns.length > 0 || isSwarmRunning) && (
-            <div className="mb-8 shrink-0" title={helpMode ? t.liveSwarmConsoleHelp : undefined}>
-              <h2 className="text-[10px] font-bold text-blue-400 uppercase tracking-widest mb-3 flex items-center gap-2">
+            <div className="flex-1 min-h-0 flex flex-col mb-4 overflow-hidden" title={helpMode ? t.liveSwarmConsoleHelp : undefined}>
+              <h2 className="text-[10px] font-bold text-blue-400 uppercase tracking-widest mb-2 flex items-center gap-2 shrink-0">
                 <Activity className="w-3 h-3" /> {t.liveSwarmConsole}
               </h2>
-              <div className="space-y-3 max-h-[280px] overflow-y-auto min-h-0 pr-1 rounded-lg border border-blue-500/20 bg-blue-500/5">
+              <div className="space-y-3 flex-1 min-h-0 overflow-y-auto pr-1 rounded-lg border border-blue-500/20 bg-blue-500/5">
                 {activeRuns.length === 0 && isSwarmRunning && (
                   <div className={`p-4 rounded-lg border border-dashed text-center ${leftSidebar.cardBg} ${leftSidebar.border}`}>
                     <p className={`text-[10px] uppercase tracking-widest animate-pulse ${leftSidebar.muted}`}>{t.waitingForAgent}</p>
                   </div>
                 )}
-                {activeRuns.map((run, idx) => (
+                {activeRuns.map((run, idx) => {
+                  const mode = run.mode || "discover";
+                  const engineLabel = mode === "extract" ? "Readability.js" : "TinyFish";
+                  const agentNum = run.agentLabel?.replace(/^(Agent|TinyFish|Readability\.js)\s*/i, "") || String(idx + 1);
+                  return (
                   <div key={`run-${run.id}-${idx}`} className={`rounded-lg border overflow-hidden ${leftSidebar.cardBg} ${leftSidebar.border}`}>
-                    <div className={`p-2 flex justify-between items-center border-b ${leftSidebar.bg} ${leftSidebar.border}`}>
-                      <div className="flex flex-col gap-0.5 min-w-0 flex-1">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <img src="/tinyfish-logo.png" alt="TinyFish" className="w-5 h-5 shrink-0 object-contain" />
-                          <span className="text-[10px] font-mono text-blue-500">{run.agentLabel?.replace(/^(Agent|TinyFish)\s*/i, "") || String(idx + 1)}</span>
-                          <span className={`text-[8px] px-1 rounded font-bold uppercase shrink-0 ${
-                            run.status === 'PENDING' ? 'bg-yellow-500/20 text-yellow-600' : 
-                            run.status === 'RUNNING' ? 'bg-green-500/20 text-green-600' : 
-                            'bg-slate-500/20 text-slate-500'
-                          }`}>
-                            {run.status}
-                          </span>
-                          <span className="text-[8px] px-1 rounded bg-slate-500/10 text-slate-500 shrink-0">{run.mode || "discover"}</span>
-                        </div>
+                    <div className={`p-3 flex gap-3 ${leftSidebar.bg}`}>
+                      <div className={`flex flex-col gap-1 min-w-[4rem] p-2 rounded border ${leftSidebar.border} ${leftSidebar.cardBg}`}>
+                        {engineLabel === "TinyFish" ? (
+                          <a
+                            href="https://tinyfish.ai"
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center justify-center"
+                            title="TinyFish"
+                          >
+                            <img src="/tinyfish-logo.png" alt="TinyFish" className="w-8 h-8 object-contain shrink-0" />
+                          </a>
+                        ) : (
+                          <div className="flex flex-col items-center gap-0.5" title="Readability.js">
+                            <FileCode className="w-6 h-6 text-emerald-500" />
+                            <span className="text-[8px] font-semibold uppercase tracking-wider text-emerald-600">{engineLabel}</span>
+                          </div>
+                        )}
+                        <span className="text-[11px] font-mono font-bold">{agentNum}</span>
+                        <span className={`text-[8px] px-1.5 py-0.5 rounded font-bold uppercase ${
+                          run.status === 'PENDING' ? 'bg-yellow-500/20 text-yellow-600' :
+                          run.status === 'RUNNING' ? 'bg-green-500/20 text-green-600' :
+                          'bg-slate-500/20 text-slate-500'
+                        }`}>{run.status}</span>
+                        <span className="text-[8px] px-1.5 py-0.5 rounded bg-slate-500/10 text-slate-500 uppercase">{mode}</span>
+                      </div>
+                      <div className="flex-1 min-w-0 flex flex-col gap-1">
                         {run.targetUrl && (
                           <span className="text-[9px] truncate block" title={run.targetUrl}>{run.targetUrl}</span>
                         )}
-                      </div>
-                      {run.streamingUrl && (
-                        <a 
-                          href={run.streamingUrl} 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="text-[10px] bg-blue-500/20 text-blue-500 px-2 py-0.5 rounded hover:bg-blue-500/30 transition-colors flex items-center gap-1 shrink-0"
-                          title={helpMode ? t.watchAgentHelp : undefined}
+                        {run.streamingUrl && (
+                          <a
+                            href={run.streamingUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-[10px] bg-blue-500/20 text-blue-500 px-2 py-0.5 rounded hover:bg-blue-500/30 transition-colors inline-flex items-center gap-1 w-fit"
+                            title={helpMode ? t.watchAgentHelp : undefined}
+                          >
+                            <ExternalLink className="w-2 h-2" /> {t.watchAgent}
+                          </a>
+                        )}
+                        <div
+                          ref={el => { agentLogRefs.current[run.id] = el; }}
+                          className={`font-mono text-[9px] max-h-[60px] overflow-y-auto ${leftSidebar.muted} ${leftSidebar.logBg} rounded p-1.5`}
                         >
-                          <ExternalLink className="w-2 h-2" /> {t.watchAgent}
-                        </a>
-                      )}
-                    </div>
-                    <div
-                      ref={el => { agentLogRefs.current[run.id] = el; }}
-                      className={`p-2 font-mono text-[9px] max-h-[75px] overflow-y-auto ${leftSidebar.muted} ${leftSidebar.logBg}`}
-                    >
-                      {liveLogs[run.id]?.map((log, i) => (
-                        <div key={`${run.id}-log-${i}`} className="mb-1.5 border-l-2 border-blue-500/40 pl-2 text-[10px] leading-tight break-words">{log}</div>
-                      )) || <div className="animate-pulse text-[10px]">{t.initializingStream}</div>}
+                          {liveLogs[run.id]?.map((log, i) => (
+                            <div key={`${run.id}-log-${i}`} className="mb-1 border-l-2 border-blue-500/40 pl-2 text-[10px] leading-tight break-words">{log}</div>
+                          )) || <div className="animate-pulse text-[10px]">{t.initializingStream}</div>}
+                        </div>
+                      </div>
                     </div>
                   </div>
-                ))}
+                );})}
               </div>
             </div>
           )}
 
-          <div>
-            <div className="mb-4">
+          <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+            <div className="mb-3 shrink-0">
               <select 
                 value={selectedFunderFilter}
                 onChange={(e) => setSelectedFunderFilter(e.target.value)}
                 className={`w-full border rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none ${leftSidebar.input}`}
                 title={helpMode ? t.orgFilterHelp : undefined}
               >
-                <option value="All">{t.allOrgs} {seeds.length} {t.organizations} ({features.length})</option>
+                <option value="All">{fundersWithCounts.length} {t.organizations} ({features.length} {t.projects})</option>
                 {fundersWithCounts.map((funder, idx) => (
                   <option key={`funder-${funder.name}-${idx}`} value={funder.name}>
                     {funder.name} ({funder.count})
@@ -967,13 +969,8 @@ export default function App() {
               </select>
             </div>
 
-            <div className="space-y-3">
-              <div className={`flex justify-between items-center p-3 rounded-lg border ${leftSidebar.cardBg} ${leftSidebar.border}`} title={helpMode ? t.filteredProjectsHelp : undefined}>
-                <span className={`text-sm ${leftSidebar.muted}`}>{t.filteredProjects}</span>
-                <span className="text-lg font-mono font-bold text-blue-500">{filteredFeatures.length}</span>
-              </div>
-              
-              <div className="mt-4 space-y-2 min-h-0 max-h-64 overflow-y-auto pr-2">
+            <div className="flex-1 min-h-0 overflow-y-auto pr-2">
+              <div className="space-y-2">
                 {filteredFeatures.map((f: any, idx: number) => (
                   <div key={`sidebar-project-${f.properties.id || idx}`} className={`p-3 rounded-lg border transition-colors ${leftSidebar.card} hover:border-blue-500/50`} title={helpMode ? t.projectCardHelp : undefined}>
                     <h3 className={`text-sm font-bold truncate ${leftSidebar.text}`}>{f.properties.title}</h3>
@@ -990,30 +987,6 @@ export default function App() {
           </div>
         </div>
         
-        {/* Export & Clear Buttons - always visible at bottom, never scroll away */}
-        <div className={`p-4 border-t space-y-2 shrink-0 ${leftSidebar.border} ${leftSidebar.bg}`}>
-          <HelpTooltip helpKey="exportGeoJSONHelp" fallbackKey="exportGeoJSON">
-          <button 
-            onClick={exportGeoJSON}
-            disabled={filteredFeatures.length === 0}
-            className={`w-full font-medium py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed border text-xs ${leftSidebar.button} ${leftSidebar.border}`}
-          >
-            <Download className="w-4 h-4" />
-            {t.exportGeoJSON}
-          </button>
-          </HelpTooltip>
-          
-          <HelpTooltip helpKey="clearAllProjectsHelp" fallbackKey="clearAllProjects">
-          <button 
-            onClick={clearProjects}
-            disabled={features.length === 0 || isSwarmRunning}
-            className="w-full bg-red-500/10 hover:bg-red-500/20 text-red-500 border border-red-500/30 font-medium py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed text-xs"
-          >
-            <Shield className="w-4 h-4" />
-            {t.clearAllProjects}
-          </button>
-          </HelpTooltip>
-        </div>
       </div>
       )}
 
@@ -1032,12 +1005,31 @@ export default function App() {
           </button>
         )}
         {view === "audit" ? (
-          <div className={`absolute inset-0 p-8 overflow-y-auto ${isDark ? "bg-slate-950" : "bg-slate-100"}`}>
-            <div className="max-w-4xl mx-auto">
-              <h2 className={`text-2xl font-bold mb-6 flex items-center gap-3 ${isDark ? "text-white" : "text-slate-900"}`} title={helpMode ? t.swarmAuditHelp : undefined}>
-                <Shield className="w-6 h-6 text-blue-500" /> {t.swarmAudit}
-              </h2>
-              <div className="grid grid-cols-3 gap-4 mb-8">
+          <div className={`absolute inset-0 flex flex-col min-h-0 p-6 ${isDark ? "bg-slate-950" : "bg-slate-100"}`}>
+            <div className="flex flex-col flex-1 min-h-0 max-w-4xl mx-auto w-full">
+              <div className={`flex items-center gap-3 mb-4 shrink-0 ${isDark ? "text-white" : "text-slate-900"}`}>
+                <h2 className="text-2xl font-bold flex items-center gap-3" title={helpMode ? t.swarmAuditHelp : undefined}>
+                  <Shield className="w-6 h-6 text-blue-500" /> {t.swarmAudit}
+                </h2>
+                <button
+                  onClick={async () => {
+                    try {
+                      await fetch("/api/audit/clear", { method: "POST", cache: "no-store" });
+                      await fetchTelemetry();
+                      await fetchFailedExtractions();
+                      await fetchProjectsWithoutImage();
+                      appendAgentLog((t as any).logs?.audit_cleared ?? "Audit cleared.");
+                    } catch (error) {
+                      console.error("Failed to clear audit:", error);
+                    }
+                  }}
+                  className={`ml-auto flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-colors ${isDark ? "bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700" : "bg-slate-200 hover:bg-slate-300 text-slate-700 border border-slate-300"}`}
+                  title={helpMode ? t.clearAuditHelp : t.clearAudit}
+                >
+                  <Trash2 className="w-4 h-4" /> {t.clearAudit}
+                </button>
+              </div>
+              <div className="grid grid-cols-3 gap-4 mb-4 shrink-0">
                 <div className={`p-4 rounded-xl border ${isDark ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"}`} title={helpMode ? t.totalExtractionsHelp : undefined}>
                   <p className={`text-xs uppercase font-bold mb-1 ${leftSidebar.muted}`}>{t.totalExtractions}</p>
                   <p className={`text-3xl font-mono ${isDark ? "text-white" : "text-slate-900"}`}>{telemetry.length}</p>
@@ -1054,34 +1046,35 @@ export default function App() {
                 </div>
               </div>
 
-              <div className={`rounded-xl border overflow-hidden mb-8 ${isDark ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"}`}>
-                <table className={`w-full text-left text-sm ${isDark ? "text-slate-300" : "text-slate-700"}`}>
-                  <thead className={isDark ? "bg-slate-800/50" : "bg-slate-100"}>
-                    <tr>
-                      <th className="p-4">{t.targetUrl}</th>
-                      <th className="p-4">{t.engine}</th>
-                      <th className="p-4">{t.status}</th>
-                      <th className="p-4">{t.duration}</th>
-                      <th className="p-4">Results</th>
-                    </tr>
-                  </thead>
-                  <tbody className={isDark ? "divide-y divide-slate-800" : "divide-y divide-slate-200"}>
-                    {telemetry.map((t, idx) => (
+              <div className={`flex-1 min-h-0 flex flex-col mb-4 ${isDark ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"} rounded-xl border`}>
+                <div className="overflow-y-auto flex-1 min-h-[10.5rem]">
+                  <table className={`w-full text-left text-sm ${isDark ? "text-slate-300" : "text-slate-700"}`}>
+                    <thead className={`sticky top-0 z-10 ${isDark ? "bg-slate-800" : "bg-slate-100"}`}>
+                      <tr>
+                        <th className="p-3">{t.targetUrl}</th>
+                        <th className="p-3">{t.engine}</th>
+                        <th className="p-3">{t.status}</th>
+                        <th className="p-3">{t.duration}</th>
+                        <th className="p-3">Results</th>
+                      </tr>
+                    </thead>
+                    <tbody className={isDark ? "divide-y divide-slate-800" : "divide-y divide-slate-200"}>
+                      {telemetry.map((t, idx) => (
                       <tr key={`audit-row-${t.id || idx}`} className={isDark ? "hover:bg-slate-800/30 transition-colors" : "hover:bg-slate-50 transition-colors"}>
-                        <td className="p-4 font-mono text-xs truncate max-w-[200px]">{t.target_url}</td>
-                        <td className="p-4">
+                        <td className="p-3 font-mono text-xs truncate max-w-[200px]">{t.target_url}</td>
+                        <td className="p-3">
                           <span className="px-2 py-1 rounded text-[10px] font-bold bg-blue-500/20 text-blue-500">
                             TINYFISH
                           </span>
                         </td>
-                        <td className="p-4">
+                        <td className="p-3">
                           <span className={`flex items-center gap-1.5 ${t.status === 'SUCCESS' ? 'text-green-600' : t.status === 'SKIPPED' ? 'text-yellow-600' : 'text-red-500'}`}>
                             <div className={`w-1.5 h-1.5 rounded-full ${t.status === 'SUCCESS' ? 'bg-green-500' : t.status === 'SKIPPED' ? 'bg-yellow-500' : 'bg-red-500'}`} />
                             {t.status}
                           </span>
                         </td>
-                        <td className={`p-4 ${leftSidebar.muted}`}>{(t.duration_ms / 1000).toFixed(1)}s</td>
-                        <td className={`p-4 font-mono ${isDark ? "text-white" : "text-slate-900"}`}>
+                        <td className={`p-3 ${leftSidebar.muted}`}>{(t.duration_ms / 1000).toFixed(1)}s</td>
+                        <td className={`p-3 font-mono ${isDark ? "text-white" : "text-slate-900"}`}>
                           {t.projects_found}
                           {(t as any).raw_response && (
                             <div className="mt-1">
@@ -1096,11 +1089,107 @@ export default function App() {
                         </td>
                       </tr>
                     ))}
-                  </tbody>
-                </table>
+                    </tbody>
+                  </table>
+                </div>
               </div>
 
-              <h3 className={`text-xl font-bold mb-4 flex items-center justify-between ${isDark ? "text-white" : "text-slate-900"}`} title={helpMode ? t.failedExtractionsHelp : undefined}>
+              <h3 className={`text-lg font-bold mb-2 shrink-0 flex items-center justify-between ${isDark ? "text-white" : "text-slate-900"}`} title={helpMode ? t.projectsWithoutImageHelp : undefined}>
+                <div className="flex items-center gap-3">
+                  <ImageOff className="w-5 h-5 text-slate-500" /> {t.projectsWithoutImage}
+                </div>
+                {projectsWithoutImage.length > 0 && (
+                  <button
+                    title={helpMode ? t.forceReextractImageHelp : t.forceReextractImage}
+                    onClick={async () => {
+                      try {
+                        localStorage.removeItem(LS_SWARM_STOPPED);
+                        swarmStoppedRef.current = false;
+                        await fetch("/api/agent/force-extract", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            projectUrls: projectsWithoutImage.map(p => p.url),
+                            proxy: selectedProxy,
+                            config: { gatekeeper: config.gatekeeper, extraction: config.extraction, agent: config.agent },
+                          }),
+                        });
+                        appendAgentLog(((t as any).logs?.force_reextract_image_queued || "Re-extraction queued for {n} projects (image refresh)").replace("{n}", String(projectsWithoutImage.length)));
+                      } catch (error) {
+                        console.error("Failed to queue re-extraction:", error);
+                      }
+                    }}
+                    className="flex items-center gap-2 px-3 py-1.5 bg-slate-500/20 text-slate-600 hover:bg-slate-500/30 dark:text-slate-400 dark:hover:bg-slate-500/30 rounded-lg text-sm font-bold transition-colors"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    {t.forceReextractImage}
+                  </button>
+                )}
+              </h3>
+
+              <div className={`flex-1 min-h-0 flex flex-col mb-4 ${isDark ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"} rounded-xl border`}>
+                <div className="overflow-y-auto flex-1 min-h-[10.5rem]">
+                  <table className={`w-full text-left text-sm ${isDark ? "text-slate-300" : "text-slate-700"}`}>
+                    <thead className={`sticky top-0 z-10 ${isDark ? "bg-slate-800" : "bg-slate-100"}`}>
+                      <tr>
+                        <th className="p-3">Title</th>
+                        <th className="p-3">URL</th>
+                        <th className="p-3">Funder</th>
+                        <th className="p-3">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className={isDark ? "divide-y divide-slate-800" : "divide-y divide-slate-200"}>
+                      {projectsWithoutImage.length === 0 ? (
+                      <tr>
+                        <td colSpan={4} className={`p-4 text-center italic ${leftSidebar.muted}`}>
+                          {t.noProjectsWithoutImage}
+                        </td>
+                      </tr>
+                    ) : (
+                      projectsWithoutImage.map((p, idx) => (
+                        <tr key={`noimg-${p.id}-${idx}`} className={isDark ? "hover:bg-slate-800/30 transition-colors" : "hover:bg-slate-50 transition-colors"}>
+                          <td className="p-3 font-medium text-xs max-w-[180px] truncate" title={p.title}>{p.title}</td>
+                          <td className="p-3 font-mono text-xs truncate max-w-[200px]" title={p.url}>
+                            <a href={p.url} target="_blank" rel="noreferrer" className="text-blue-500 hover:underline">
+                              {p.url}
+                            </a>
+                          </td>
+                          <td className={`p-3 text-xs ${leftSidebar.muted}`}>{p.funder}</td>
+                          <td className="p-3">
+                            <button
+                              onClick={async () => {
+                                try {
+                                  localStorage.removeItem(LS_SWARM_STOPPED);
+                                  swarmStoppedRef.current = false;
+                                  await fetch("/api/agent/force-extract", {
+                                    method: "POST",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({
+                                      projectUrls: [p.url],
+                                      proxy: selectedProxy,
+                                      config: { gatekeeper: config.gatekeeper, extraction: config.extraction, agent: config.agent },
+                                    }),
+                                  });
+                                  appendAgentLog(((t as any).logs?.force_extract_queued || "Re-extraction queued for 1 URL").replace("{n}", "1"));
+                                } catch (error) {
+                                  console.error("Failed to queue re-extraction:", error);
+                                }
+                              }}
+                              className={`p-1.5 rounded transition-colors ${leftSidebar.button} ${leftSidebar.text}`}
+                              title={t.forceReextractImage}
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <h3 className={`text-lg font-bold mb-2 shrink-0 flex items-center justify-between ${isDark ? "text-white" : "text-slate-900"}`} title={helpMode ? t.failedExtractionsHelp : undefined}>
                 <div className="flex items-center gap-3">
                   <AlertTriangle className="w-5 h-5 text-yellow-500" /> {t.failedExtractions}
                 </div>
@@ -1109,13 +1198,15 @@ export default function App() {
                     title={helpMode ? t.forceExtractHelp : undefined}
                     onClick={async () => {
                       try {
+                        localStorage.removeItem(LS_SWARM_STOPPED);
+                        swarmStoppedRef.current = false;
                         await fetch("/api/agent/force-extract", {
                           method: "POST",
                           headers: { "Content-Type": "application/json" },
                           body: JSON.stringify({ 
                             projectUrls: failedExtractions.map(f => f.project_url),
                             proxy: selectedProxy,
-                            config: { gatekeeper: config.gatekeeper, extraction: config.extraction },
+                            config: { gatekeeper: config.gatekeeper, extraction: config.extraction, agent: config.agent },
                           }),
                         });
                         appendAgentLog(((t as any).logs?.force_extract_queued || "Forced extraction queued for {n} URLs").replace("{n}", String(failedExtractions.length)));
@@ -1131,50 +1222,53 @@ export default function App() {
                 )}
               </h3>
               
-              <div className={`rounded-xl border overflow-hidden ${isDark ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"}`}>
-                <table className={`w-full text-left text-sm ${isDark ? "text-slate-300" : "text-slate-700"}`}>
-                  <thead className={isDark ? "bg-slate-800/50" : "bg-slate-100"}>
-                    <tr>
-                      <th className="p-4">Source URL</th>
-                      <th className="p-4">Project URL</th>
-                      <th className="p-4">{t.error}</th>
-                      <th className="p-4">Time</th>
-                      <th className="p-4">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody className={isDark ? "divide-y divide-slate-800" : "divide-y divide-slate-200"}>
-                    {failedExtractions.length === 0 ? (
+              <div className={`flex-1 min-h-0 flex flex-col ${isDark ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"} rounded-xl border`}>
+                <div className="overflow-y-auto flex-1 min-h-[10.5rem]">
+                  <table className={`w-full text-left text-sm ${isDark ? "text-slate-300" : "text-slate-700"}`}>
+                    <thead className={`sticky top-0 z-10 ${isDark ? "bg-slate-800" : "bg-slate-100"}`}>
                       <tr>
-                        <td colSpan={5} className={`p-8 text-center italic ${leftSidebar.muted}`}>
+                        <th className="p-3">Source URL</th>
+                        <th className="p-3">Project URL</th>
+                        <th className="p-3">{t.error}</th>
+                        <th className="p-3">Time</th>
+                        <th className="p-3">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className={isDark ? "divide-y divide-slate-800" : "divide-y divide-slate-200"}>
+                      {failedExtractions.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className={`p-4 text-center italic ${leftSidebar.muted}`}>
                           No failed extractions recorded.
                         </td>
                       </tr>
                     ) : (
                       failedExtractions.map((f, idx) => (
                         <tr key={`failed-row-${f.id || idx}`} className={isDark ? "hover:bg-slate-800/30 transition-colors" : "hover:bg-slate-50 transition-colors"}>
-                          <td className="p-4 font-mono text-xs truncate max-w-[150px]" title={f.target_url}>{f.target_url}</td>
-                          <td className="p-4 font-mono text-xs truncate max-w-[150px]" title={f.project_url}>
+                          <td className="p-3 font-mono text-xs truncate max-w-[150px]" title={f.target_url}>{f.target_url}</td>
+                          <td className="p-3 font-mono text-xs truncate max-w-[150px]" title={f.project_url}>
                             <a href={f.project_url} target="_blank" rel="noreferrer" className="text-blue-500 hover:underline">
                               {f.project_url}
                             </a>
                           </td>
-                          <td className="p-4 text-red-500 text-xs max-w-[200px] truncate" title={f.error_message}>
+                          <td className="p-3 text-red-500 text-xs max-w-[200px] truncate" title={f.error_message}>
                             {f.error_message}
                           </td>
-                          <td className={`p-4 text-xs ${leftSidebar.muted}`}>
+                          <td className={`p-3 text-xs ${leftSidebar.muted}`}>
                             {new Date(f.created_at).toLocaleString()}
                           </td>
-                          <td className="p-4">
+                          <td className="p-3">
                             <button
                               onClick={async () => {
                                 try {
+                                  localStorage.removeItem(LS_SWARM_STOPPED);
+                                  swarmStoppedRef.current = false;
                                   await fetch("/api/agent/force-extract", {
                                     method: "POST",
                                     headers: { "Content-Type": "application/json" },
                                     body: JSON.stringify({ 
                                       projectUrls: [f.project_url],
                                       proxy: selectedProxy,
-                                      config: { gatekeeper: config.gatekeeper, extraction: config.extraction },
+                                      config: { gatekeeper: config.gatekeeper, extraction: config.extraction, agent: config.agent },
                                     }),
                                   });
                                   appendAgentLog(((t as any).logs?.force_extract_queued || "Forced extraction queued for {n} URLs").replace("{n}", "1"));
@@ -1191,8 +1285,9 @@ export default function App() {
                         </tr>
                       ))
                     )}
-                  </tbody>
-                </table>
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
           </div>
@@ -1210,6 +1305,7 @@ export default function App() {
             preferCanvas
           >
             <MapFitWorld />
+            <MapResizeOnSidebarChange sidebarOpen={sidebarOpen} settingsOpen={settingsSidebarOpen} />
             <TileLayer
               attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
               url={theme === "dark" ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" : "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"}
@@ -1233,6 +1329,19 @@ export default function App() {
             onThemeChange={setTheme}
             open={settingsSidebarOpen}
             onToggle={() => setSettingsSidebarOpen((o) => !o)}
+            paramsLocked={isSwarmRunning}
+            onExportGeoJSON={exportGeoJSON}
+            exportGeoJSONDisabled={filteredFeatures.length === 0}
+            onClearAllProjects={clearProjects}
+            clearAllProjectsDisabled={features.length === 0 || isSwarmRunning}
+            projectsCount={features.length}
+            targetMode={targetMode}
+            onTargetModeChange={setTargetMode}
+            selectedProxy={selectedProxy}
+            onSelectedProxyChange={setSelectedProxy}
+            loading={loading}
+            seedsLength={seeds.length}
+            proxyLocations={PROXY_LOCATIONS}
           />
         </div>
       </div>
