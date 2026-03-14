@@ -19,6 +19,11 @@ body {
   overflow: hidden;
 }
 
+/* Dark mode: assombrir les tuiles OSM (évite Carto qui renvoie 400) */
+.leaflet-tile-pane .map-tiles-dark img {
+  filter: invert(1) hue-rotate(180deg) brightness(0.92) contrast(0.88);
+}
+
 /* Leaflet: remove default margin, force full size. En vue monde, Web Mercator (carré) laisse des bandes (letterboxing) : fond sombre pour qu'elles se fondent */
 .leaflet-container {
   margin: 0 !important;

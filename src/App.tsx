@@ -1317,8 +1317,9 @@ safeStorage.setItem(LS_PROJECTS_CLEARED, "1");
             <MapFitWorld />
             <MapResizeOnSidebarChange sidebarOpen={sidebarOpen} settingsOpen={settingsSidebarOpen} />
             <TileLayer
-              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
-              url={theme === "dark" ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png" : "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"}
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+              url={theme === "dark" ? "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"}
+              className={theme === "dark" ? "map-tiles-dark" : undefined}
               noWrap
             />
             <MapViewportHandler
