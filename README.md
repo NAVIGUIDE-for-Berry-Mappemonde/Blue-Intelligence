@@ -9,7 +9,7 @@
 <table>
   <tr>
     <td align="center" width="33%">
-      <a href="https://github.com/NAVIGUIDE-for-Berry-Mappemonde/Blue-Intelligence" target="_blank" rel="noreferrer">
+      <a href="https://www.blueintelligence.online" target="_blank" rel="noreferrer">
         <img src="public/logo-blue-intelligence.svg" alt="Blue Intelligence" width="80" height="80" />
       </a>
       <br />
@@ -18,7 +18,7 @@
       <sub>Maritime OSINT</sub>
     </td>
     <td align="center" width="33%">
-      <a href="https://naviguide.fr" target="_blank" rel="noreferrer">
+      <a href="https://www.naviguide.fr" target="_blank" rel="noreferrer">
         <img src="public/logo-naviguide.png" alt="NAVIGUIDE" width="80" height="80" />
       </a>
       <br />
@@ -27,7 +27,7 @@
       <sub>Intelligent navigation</sub>
     </td>
     <td align="center" width="33%">
-      <a href="https://berrymappemonde.org" target="_blank" rel="noreferrer">
+      <a href="https://www.berrymappemonde.org" target="_blank" rel="noreferrer">
         <img src="public/logo-berry-mappemonde.png" alt="Berry-Mappemonde" width="80" height="80" />
       </a>
       <br />
