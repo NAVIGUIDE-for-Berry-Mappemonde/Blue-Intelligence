@@ -8,6 +8,7 @@ import { loadTheme, saveTheme, type Theme } from "./theme";
 import { safeStorage } from "./utils/safeStorage";
 import { useI18n } from "./i18n/useI18n";
 import { HelpTooltip } from "./components/HelpTooltip";
+import { ErrorBoundary } from "./ErrorBoundary";
 import L from "leaflet";
 
 // Persist Stop/Clear intent across reloads (requests may be aborted on page unload)
@@ -878,8 +879,15 @@ safeStorage.setItem(LS_PROJECTS_CLEARED, "1");
               </div>
           </div>
 
-          {/* Live Swarm Console - scrollable */}
+          {/* Live Swarm Console - scrollable, isolé pour éviter crash DOM (TinyFish) */}
           {(activeRuns.length > 0 || isSwarmRunning) && (
+            <ErrorBoundary
+              fallback={
+                <div className={`flex-1 min-h-0 flex flex-col mb-4 overflow-hidden rounded-lg border border-amber-500/30 bg-amber-500/10 p-3`}>
+                  <p className="text-[10px] text-amber-600 dark:text-amber-400">Console temporairement indisponible (conflit TinyFish). Rechargez si besoin.</p>
+                </div>
+              }
+            >
             <div className="flex-1 min-h-0 flex flex-col mb-4 overflow-hidden" title={helpMode ? t.liveSwarmConsoleHelp : undefined}>
               <h2 className="text-[10px] font-bold text-blue-400 uppercase tracking-widest mb-2 flex items-center gap-2 shrink-0">
                 <Activity className="w-3 h-3" /> {t.liveSwarmConsole}
@@ -951,6 +959,7 @@ safeStorage.setItem(LS_PROJECTS_CLEARED, "1");
                 );})}
               </div>
             </div>
+            </ErrorBoundary>
           )}
 
           <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
