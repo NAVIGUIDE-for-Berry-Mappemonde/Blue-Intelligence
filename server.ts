@@ -1391,6 +1391,16 @@ async function startServer() {
   });
   app.options("*", (_req, res) => res.sendStatus(204));
 
+  app.get("/favicon.ico", (_req, res) => {
+    const svgPath = path.join(__dirname, "dist", "logo-blue-intelligence.svg");
+    if (fs.existsSync(svgPath)) {
+      res.setHeader("Content-Type", "image/svg+xml");
+      res.sendFile(svgPath);
+    } else {
+      res.status(404).end();
+    }
+  });
+
   const DEBUG_API = process.env.DEBUG_API === "1" || process.env.DEBUG_API === "true";
   app.use((req, res, next) => {
     if (DEBUG_API && req.path.startsWith("/api/")) {
