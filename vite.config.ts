@@ -15,7 +15,7 @@ export default defineConfig({
     },
     server: {
       hmr: process.env.DISABLE_HMR !== 'true'
-        ? { port: process.env.HMR_PORT ? parseInt(process.env.HMR_PORT, 10) : 0 }
+        ? { port: process.env.HMR_PORT ? parseInt(process.env.HMR_PORT, 10) : 24680 + (process.pid % 1000) }
         : false,
       allowedHosts: ['.trycloudflare.com', '.ngrok-free.dev', '.ngrok.io'],
       watch: {

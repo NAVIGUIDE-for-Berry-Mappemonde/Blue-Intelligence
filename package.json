@@ -10,6 +10,7 @@
     "last 2 Edge versions"
   ],
   "scripts": {
+"start": "NODE_ENV=production tsx server.ts",
     "dev": "tsx server.ts",
     "build": "vite build",
     "preview": "vite preview",

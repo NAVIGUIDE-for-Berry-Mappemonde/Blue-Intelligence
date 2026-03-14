@@ -5,6 +5,7 @@ import { Activity, Globe, Shield, Waves, Play, Loader2, Filter, ExternalLink, Al
 import { useConfig } from "./config/useConfig";
 import { SettingsSidebar } from "./components/SettingsSidebar";
 import { loadTheme, saveTheme, type Theme } from "./theme";
+import { safeStorage } from "./utils/safeStorage";
 import { useI18n } from "./i18n/useI18n";
 import { HelpTooltip } from "./components/HelpTooltip";
 import L from "leaflet";
@@ -334,8 +335,8 @@ export default function App() {
   const eventSources = useRef<Record<string, EventSource>>({});
   const mainLogRef = useRef<HTMLDivElement>(null);
   const agentLogRefs = useRef<Record<string, HTMLDivElement | null>>({});
-  const swarmStoppedRef = useRef(localStorage.getItem(LS_SWARM_STOPPED) === "1");
-  const projectsClearedRef = useRef(localStorage.getItem(LS_PROJECTS_CLEARED) === "1");
+  const swarmStoppedRef = useRef(safeStorage.getItem(LS_SWARM_STOPPED) === "1");
+  const projectsClearedRef = useRef(safeStorage.getItem(LS_PROJECTS_CLEARED) === "1");
   const { config, updateGatekeeper, updateExtraction, updateAgent } = useConfig();
   const { t, helpMode } = useI18n();
 
@@ -370,7 +371,7 @@ export default function App() {
         return;
       }
       // Persisted Clear: after reload, localStorage ensures we stay empty until next deploy
-      if (localStorage.getItem(LS_PROJECTS_CLEARED) === "1") {
+      if (safeStorage.getItem(LS_PROJECTS_CLEARED) === "1") {
         setProjects({ type: "FeatureCollection", features: [] });
         return;
       }
@@ -444,7 +445,7 @@ export default function App() {
         return;
       }
       // Persisted Stop: after reload, localStorage ensures we stay empty until next deploy
-      if (localStorage.getItem(LS_SWARM_STOPPED) === "1") {
+      if (safeStorage.getItem(LS_SWARM_STOPPED) === "1") {
         setActiveRuns([]);
         Object.keys(eventSources.current).forEach(id => {
           eventSources.current[id]?.close();
@@ -530,7 +531,7 @@ export default function App() {
 
   const fetchQueueStatus = async () => {
     try {
-      if (localStorage.getItem(LS_SWARM_STOPPED) === "1") {
+      if (safeStorage.getItem(LS_SWARM_STOPPED) === "1") {
         setQueueStatus({ active: 0, queued: 0 });
         return;
       }
@@ -562,10 +563,10 @@ export default function App() {
 
   useEffect(() => {
     // Re-sync server on load if user had Stop/Clear before reload (requests may have been aborted)
-    if (localStorage.getItem(LS_SWARM_STOPPED) === "1") {
+    if (safeStorage.getItem(LS_SWARM_STOPPED) === "1") {
       fetch("/api/agent/stop", { method: "POST", cache: "no-store" }).catch(() => {});
     }
-    if (localStorage.getItem(LS_PROJECTS_CLEARED) === "1") {
+    if (safeStorage.getItem(LS_PROJECTS_CLEARED) === "1") {
       fetch("/api/projects/clear", { method: "POST", cache: "no-store" }).catch(() => {});
     }
     fetchProjects();
@@ -586,7 +587,7 @@ export default function App() {
     const es = new EventSource("/api/projects/stream");
     es.onmessage = (e) => {
       try {
-        if (projectsClearedRef.current || localStorage.getItem(LS_PROJECTS_CLEARED) === "1") return;
+        if (projectsClearedRef.current || safeStorage.getItem(LS_PROJECTS_CLEARED) === "1") return;
         const feature = JSON.parse(e.data);
         const title = feature?.properties?.title || feature?.properties?.url || "—";
         appendAgentLog(((t as any).logs?.project_added || "Project added: {title}").replace("{title}", String(title).slice(0, 40) + (String(title).length > 40 ? "…" : "")));
@@ -611,8 +612,8 @@ export default function App() {
 
   const deploySwarm = async () => {
     if (isSwarmRunning) return; // Prevent double deploy
-    localStorage.removeItem(LS_SWARM_STOPPED);
-    localStorage.removeItem(LS_PROJECTS_CLEARED);
+safeStorage.removeItem(LS_SWARM_STOPPED);
+      safeStorage.removeItem(LS_PROJECTS_CLEARED);
     swarmStoppedRef.current = false;
     projectsClearedRef.current = false;
     setLoading(true);
@@ -646,7 +647,7 @@ export default function App() {
 
   const stopSwarm = async () => {
     try {
-      localStorage.setItem(LS_SWARM_STOPPED, "1");
+      safeStorage.setItem(LS_SWARM_STOPPED, "1");
       swarmStoppedRef.current = true;
       setActiveRuns([]);
       setQueueStatus({ active: 0, queued: 0 });
@@ -658,7 +659,7 @@ export default function App() {
       console.error("Failed to stop swarm:", error);
       appendAgentLog((t as any).logs?.stop_fail || "Stop swarm failed.");
       swarmStoppedRef.current = false;
-      localStorage.removeItem(LS_SWARM_STOPPED);
+      safeStorage.removeItem(LS_SWARM_STOPPED);
     } finally {
       setLoading(false);
     }
@@ -666,8 +667,8 @@ export default function App() {
 
   const clearProjects = async () => {
     try {
-      localStorage.setItem(LS_PROJECTS_CLEARED, "1");
-      localStorage.setItem(LS_SWARM_STOPPED, "1");
+safeStorage.setItem(LS_PROJECTS_CLEARED, "1");
+        safeStorage.setItem(LS_SWARM_STOPPED, "1");
       projectsClearedRef.current = true;
       swarmStoppedRef.current = true;
       setProjects({ type: "FeatureCollection", features: [] });
@@ -681,15 +682,15 @@ export default function App() {
       } else {
         projectsClearedRef.current = false;
         swarmStoppedRef.current = false;
-        localStorage.removeItem(LS_PROJECTS_CLEARED);
-        localStorage.removeItem(LS_SWARM_STOPPED);
+        safeStorage.removeItem(LS_PROJECTS_CLEARED);
+        safeStorage.removeItem(LS_SWARM_STOPPED);
       }
     } catch (error) {
       console.error("Failed to clear projects:", error);
       projectsClearedRef.current = false;
       swarmStoppedRef.current = false;
-      localStorage.removeItem(LS_PROJECTS_CLEARED);
-      localStorage.removeItem(LS_SWARM_STOPPED);
+      safeStorage.removeItem(LS_PROJECTS_CLEARED);
+      safeStorage.removeItem(LS_SWARM_STOPPED);
     }
   };
 
@@ -1103,7 +1104,7 @@ export default function App() {
                     title={helpMode ? t.forceReextractImageHelp : t.forceReextractImage}
                     onClick={async () => {
                       try {
-                        localStorage.removeItem(LS_SWARM_STOPPED);
+                        safeStorage.removeItem(LS_SWARM_STOPPED);
                         swarmStoppedRef.current = false;
                         await fetch("/api/agent/force-extract", {
                           method: "POST",
@@ -1159,7 +1160,7 @@ export default function App() {
                             <button
                               onClick={async () => {
                                 try {
-                                  localStorage.removeItem(LS_SWARM_STOPPED);
+                                  safeStorage.removeItem(LS_SWARM_STOPPED);
                                   swarmStoppedRef.current = false;
                                   await fetch("/api/agent/force-extract", {
                                     method: "POST",
@@ -1198,7 +1199,7 @@ export default function App() {
                     title={helpMode ? t.forceExtractHelp : undefined}
                     onClick={async () => {
                       try {
-                        localStorage.removeItem(LS_SWARM_STOPPED);
+                        safeStorage.removeItem(LS_SWARM_STOPPED);
                         swarmStoppedRef.current = false;
                         await fetch("/api/agent/force-extract", {
                           method: "POST",
@@ -1260,7 +1261,7 @@ export default function App() {
                             <button
                               onClick={async () => {
                                 try {
-                                  localStorage.removeItem(LS_SWARM_STOPPED);
+                                  safeStorage.removeItem(LS_SWARM_STOPPED);
                                   swarmStoppedRef.current = false;
                                   await fetch("/api/agent/force-extract", {
                                     method: "POST",

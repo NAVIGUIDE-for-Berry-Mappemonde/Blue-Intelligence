@@ -1381,6 +1381,16 @@ async function startServer() {
 
   app.use(express.json());
 
+  // CORS + frame-ancestors: permet au flux TinyFish (inspector) d'afficher l'app sans blocage
+  app.use((_req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Content-Security-Policy", "frame-ancestors 'self' https://tetra-streaming.tinyfish.io https://*.tinyfish.io");
+    next();
+  });
+  app.options("*", (_req, res) => res.sendStatus(204));
+
   const DEBUG_API = process.env.DEBUG_API === "1" || process.env.DEBUG_API === "true";
   app.use((req, res, next) => {
     if (DEBUG_API && req.path.startsWith("/api/")) {
